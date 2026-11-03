@@ -60,13 +60,38 @@ export async function githubNotified(
   return threads.data.some((thread) => subject.test(thread.subject.url ?? ""));
 }
 
-/** Rebuilds the webhook-shaped event GitHub would have delivered for this notification. */
+/** Identifies the GitHub content, not the email, so differently-forged mails can't replay it. */
+export function notificationDeliveryId(ref: NotificationRef): string {
+  let detail: number | string = "";
+  if (ref.kind === "comment") detail = ref.commentId;
+  if (ref.kind === "review") detail = ref.reviewId;
+  return `email:${ref.owner}/${ref.repo}/${ref.kind}/${ref.number}/${detail}`.toLowerCase();
+}
+
+/** The fetched content must belong to the item the email names and be recent, or it's a replay. */
+function boundToRef(
+  parentUrl: string | null | undefined,
+  createdAt: string | null | undefined,
+  expectedParent: string,
+  now: number,
+): boolean {
+  return (
+    parentUrl?.endsWith(expectedParent) === true &&
+    Date.parse(createdAt ?? "") >= now - NOTIFIED_WITHIN_MS
+  );
+}
+
+/**
+ * Rebuilds the webhook-shaped event GitHub would have delivered for this notification, or
+ * `undefined` when the referenced content doesn't belong to the named item or is too old.
+ */
 export async function eventForNotification(
   octokit: Pick<Octokit, "request">,
   ref: NotificationRef,
   installationId: number,
   deliveryId: string,
-): Promise<NormalizedGitHubEvent> {
+  now: number = Date.now(),
+): Promise<NormalizedGitHubEvent | undefined> {
   const target = { owner: ref.owner, repo: ref.repo };
   const repository = (await octokit.request("GET /repos/{owner}/{repo}", target)).data;
   const common = { repository, installation: { id: installationId } };
@@ -83,6 +108,8 @@ export async function eventForNotification(
         issue_number: ref.number,
       }),
     ]);
+    if (!boundToRef(comment.data.issue_url, comment.data.created_at, `/issues/${ref.number}`, now))
+      return undefined;
     type = "issue_comment";
     payload = {
       action: "created",
@@ -102,6 +129,15 @@ export async function eventForNotification(
         pull_number: ref.number,
       }),
     ]);
+    if (
+      !boundToRef(
+        review.data.pull_request_url,
+        review.data.submitted_at,
+        `/pulls/${ref.number}`,
+        now,
+      )
+    )
+      return undefined;
     type = "pull_request_review";
     payload = {
       action: "submitted",
@@ -114,6 +150,8 @@ export async function eventForNotification(
       ...target,
       pull_number: ref.number,
     });
+    if (!boundToRef(pullRequest.data.url, pullRequest.data.created_at, `/pulls/${ref.number}`, now))
+      return undefined;
     type = "pull_request";
     payload = { action: "opened", pull_request: pullRequest.data, sender: pullRequest.data.user };
   } else {
@@ -122,6 +160,8 @@ export async function eventForNotification(
       issue_number: ref.number,
     });
     // The issues API also returns pull requests; a PR's opening mail uses the /pull/ id.
+    if (!boundToRef(issue.data.url, issue.data.created_at, `/issues/${ref.number}`, now))
+      return undefined;
     type = "issues";
     payload = { action: "opened", issue: issue.data, sender: issue.data.user };
   }
@@ -176,13 +216,17 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
       logger.warn({ messageId }, "dropping email with no matching GitHub notification");
       return;
     }
-    const deliveryId = `email:${messageId}`;
+    const deliveryId = notificationDeliveryId(ref);
     const event = await eventForNotification(
       options.octokit,
       ref,
       options.installationId,
       deliveryId,
     );
+    if (event === undefined) {
+      logger.warn({ messageId }, "dropping email whose content is stale or belongs elsewhere");
+      return;
+    }
     const source = `github.${event.type}`;
     const acceptance = await options.accept({
       installationId: event.installationId,

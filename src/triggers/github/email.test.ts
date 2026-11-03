@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { classifyGitHubEvent } from "./classification.js";
-import { eventForNotification, githubNotified, parseNotificationMessageId } from "./email.js";
+import {
+  eventForNotification,
+  githubNotified,
+  notificationDeliveryId,
+  parseNotificationMessageId,
+} from "./email.js";
 
 describe("github notification emails", () => {
   it("parses the Message-ID shapes GitHub uses", () => {
@@ -36,6 +41,8 @@ describe("github notification emails", () => {
       "GET /repos/{owner}/{repo}": { id: 99, full_name: "octo/hub" },
       "GET /repos/{owner}/{repo}/issues/comments/{comment_id}": {
         id: 345,
+        issue_url: "https://api.github.com/repos/octo/hub/issues/7",
+        created_at: "2026-11-01T00:00:00Z",
         body: "/paseo fix it",
         user: { login: "maintainer" },
       },
@@ -52,19 +59,29 @@ describe("github notification emails", () => {
       request: (route: string) => Promise.resolve({ data: responses[route] }),
     } as unknown as Parameters<typeof eventForNotification>[0];
     const ref = parseNotificationMessageId("<octo/hub/pull/7/c345@github.com>")!;
-    const event = await eventForNotification(octokit, ref, 42, "email:x");
+    const now = Date.parse("2026-11-03T00:00:00Z");
+    const event = await eventForNotification(octokit, ref, 42, "email:x", now);
     expect(event).toMatchObject({
       type: "issue_comment",
       repo: "octo/hub",
       repositoryId: 99,
       installationId: 42,
     });
-    expect(classifyGitHubEvent(event)).toMatchObject({
+    expect(classifyGitHubEvent(event!)).toMatchObject({
       semanticEvent: "github.pull_request_comment_created",
       actor: "maintainer",
       text: "/paseo fix it",
       item: { type: "pull_request", number: 7 },
     });
+
+    // A forged mail pairing a notified thread with a comment from another item, or an old one.
+    const elsewhere = parseNotificationMessageId("<octo/hub/pull/8/c345@github.com>")!;
+    await expect(
+      eventForNotification(octokit, elsewhere, 42, "email:y", now),
+    ).resolves.toBeUndefined();
+    const later = now + 8 * 24 * 60 * 60 * 1000;
+    await expect(eventForNotification(octokit, ref, 42, "email:z", later)).resolves.toBeUndefined();
+    expect(notificationDeliveryId(ref)).toBe("email:octo/hub/comment/7/345");
   });
 
   it("only trusts emails GitHub actually sent a notification for", async () => {
