@@ -38,7 +38,11 @@ describe("github notification emails", () => {
 
   it("rebuilds a pull request comment the classifier understands", async () => {
     const responses: Record<string, unknown> = {
-      "GET /repos/{owner}/{repo}": { id: 99, full_name: "octo/hub" },
+      "GET /repos/{owner}/{repo}": {
+        id: 99,
+        full_name: "octo/hub",
+        url: "https://api.github.com/repos/octo/hub",
+      },
       "GET /repos/{owner}/{repo}/issues/comments/{comment_id}": {
         id: 345,
         issue_url: "https://api.github.com/repos/octo/hub/issues/7",
@@ -60,7 +64,7 @@ describe("github notification emails", () => {
     } as unknown as Parameters<typeof eventForNotification>[0];
     const ref = parseNotificationMessageId("<octo/hub/pull/7/c345@github.com>")!;
     const now = Date.parse("2026-11-03T00:00:00Z");
-    const event = await eventForNotification(octokit, ref, 42, "email:x", now);
+    const event = await eventForNotification(octokit, ref, 42, now);
     expect(event).toMatchObject({
       type: "issue_comment",
       repo: "octo/hub",
@@ -76,12 +80,16 @@ describe("github notification emails", () => {
 
     // A forged mail pairing a notified thread with a comment from another item, or an old one.
     const elsewhere = parseNotificationMessageId("<octo/hub/pull/8/c345@github.com>")!;
-    await expect(
-      eventForNotification(octokit, elsewhere, 42, "email:y", now),
-    ).resolves.toBeUndefined();
+    await expect(eventForNotification(octokit, elsewhere, 42, now)).resolves.toBeUndefined();
     const later = now + 8 * 24 * 60 * 60 * 1000;
-    await expect(eventForNotification(octokit, ref, 42, "email:z", later)).resolves.toBeUndefined();
-    expect(notificationDeliveryId(ref)).toBe("email:octo/hub/comment/7/345");
+    await expect(eventForNotification(octokit, ref, 42, later)).resolves.toBeUndefined();
+    expect(event!.id).toBe("email:99/comment/7/345");
+
+    // The /issues/ form of a pull request is not a new issue, and both forms share one key.
+    const issueForm = parseNotificationMessageId("<octo/hub/issues/7@github.com>")!;
+    await expect(eventForNotification(octokit, issueForm, 42, now)).resolves.toBeUndefined();
+    const pullForm = parseNotificationMessageId("<OCTO/Hub/pull/7@github.com>")!;
+    expect(notificationDeliveryId(issueForm, 99)).toBe(notificationDeliveryId(pullForm, 99));
   });
 
   it("only trusts emails GitHub actually sent a notification for", async () => {
