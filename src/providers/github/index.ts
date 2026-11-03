@@ -41,6 +41,12 @@ import type { ConnectionResolutionContext } from "../../config/connections.js";
 import type { ProjectConfigurationStore } from "../../configuration/store.js";
 import { replyOutputTool } from "../../execution-capabilities/outputs.js";
 import { createGitHubReplyExecutor, githubReplyAvailable } from "../../triggers/github/reply.js";
+import { createEmailSource } from "../../triggers/github/email.js";
+import {
+  createPersonalGitHubAccount,
+  readPersonalGitHubEnvironment,
+  type PersonalGitHubEnvironment,
+} from "./personal.js";
 
 export interface GitHubRegistrationConfiguration {
   appId: string;
@@ -64,6 +70,8 @@ export interface CreateGitHubRegistrationOptions {
   fetch?: typeof fetch;
   configurationProvider?: GitHubConfigurationProvider;
   configurationVersion?: number;
+  /** Defaults to `GITHUB_PERSONAL_TOKEN` and friends; `null` disables the personal account. */
+  personal?: PersonalGitHubEnvironment | null;
 }
 
 interface GitHubConnectionOptions {
@@ -91,6 +99,7 @@ export function createGitHubRegistration(
   const appAuth =
     options.appAuth ??
     createGitHubAuth({ appId: configuration.appId, privateKey: configuration.privateKey });
+  const { personal, email } = createPersonalGitHub(options, database, configuration);
   const client =
     options.connectionClient ??
     createGitHubConnectionClient({
@@ -161,7 +170,13 @@ export function createGitHubRegistration(
       );
     },
   });
-  const reactions = options.reactionClient ?? createGitHubReactionClient(appAuth);
+  const reactions =
+    options.reactionClient ??
+    createGitHubReactionClient(
+      personal === undefined
+        ? appAuth
+        : { createInstallationOctokit: () => Promise.resolve(personal.octokit) },
+    );
   const comments = {
     async createIssueComment(input: {
       installationId: number;
@@ -170,7 +185,8 @@ export function createGitHubRegistration(
       issueNumber: number;
       body: string;
     }) {
-      const octokit = await appAuth.createInstallationOctokit(input.installationId);
+      const octokit =
+        personal?.octokit ?? (await appAuth.createInstallationOctokit(input.installationId));
       await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
         owner: input.owner,
         repo: input.repo,
@@ -179,7 +195,10 @@ export function createGitHubRegistration(
       });
     },
   };
-  logger.info("using webhook event source");
+  logger.info(
+    { personalAccount: personal !== undefined, emailNotifications: email !== undefined },
+    "using webhook event source",
+  );
   return {
     configurationSnapshot: {
       version: options.configurationVersion ?? 0,
@@ -203,7 +222,9 @@ export function createGitHubRegistration(
         if (selectedConnection === undefined || selectedConnection.status !== "active") {
           throw new Error(`github connection is unavailable: ${connectionSlug}`);
         }
-        const token = await appAuth.mintInstallationToken(selectedConnection.installationId);
+        const token =
+          personal?.lease() ??
+          (await appAuth.mintInstallationToken(selectedConnection.installationId));
         await context?.registerToken?.({
           provider: "github",
           token: token.token,
@@ -225,6 +246,10 @@ export function createGitHubRegistration(
           if (selectedConnection === undefined || selectedConnection.status !== "active") {
             throw new Error(`github connection is unavailable: ${input.connectionSlug}`);
           }
+          if (personal !== undefined) {
+            const account = await personal.identity();
+            return { ...personal.lease(), botUserId: account.id, botLogin: account.login };
+          }
           repositoryNamesForAccount(input.repositories, selectedConnection.accountLogin);
           const token = await appAuth.mintInstallationAccessToken({
             installationId: selectedConnection.installationId,
@@ -245,7 +270,9 @@ export function createGitHubRegistration(
             throw error;
           }
         },
-        revoke: (token) => appAuth.revokeInstallationToken(token),
+        // Hub never revokes the personal token; only the operator can.
+        revoke: (token) =>
+          token === personal?.token ? Promise.resolve() : appAuth.revokeInstallationToken(token),
       },
     },
     triggerProviders: [
@@ -264,10 +291,12 @@ export function createGitHubRegistration(
       {
         async start(handler) {
           await webhook.start(handler);
+          await email?.start(handler);
           lifecycle.start();
         },
         async stop() {
           await webhook.stop();
+          await email?.stop();
           await lifecycle.stop();
         },
       },
@@ -282,6 +311,34 @@ export function createGitHubRegistration(
     ],
     requests: [{ name: "webhook", handle: (request) => webhook.handle(request) }],
   };
+}
+
+function createPersonalGitHub(
+  options: CreateGitHubRegistrationOptions,
+  database: Database,
+  configuration: GitHubRegistrationConfiguration,
+) {
+  const environment =
+    options.personal === undefined
+      ? readPersonalGitHubEnvironment(process.env)
+      : (options.personal ?? undefined);
+  if (environment === undefined) return { personal: undefined, email: undefined };
+  const personal = createPersonalGitHubAccount(environment.token, options.fetch);
+  const email =
+    environment.imapUrl === undefined || environment.installationId === undefined
+      ? undefined
+      : createEmailSource({
+          imapUrl: environment.imapUrl,
+          installationId: environment.installationId,
+          octokit: personal.octokit,
+          accept: (input) =>
+            database.acceptGitHubEvent({
+              ...input,
+              providerApplicationId: configuration.appId,
+              providerConfigurationVersion: options.configurationVersion ?? 0,
+            }),
+        });
+  return { personal, email };
 }
 
 function emptyGitHubRegistration(
