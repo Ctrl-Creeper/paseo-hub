@@ -1,0 +1,79 @@
+name: Sync Upstream Release
+
+# ponytail: forks get no event for upstream releases, so poll the latest release daily.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: getpaseo/hub
+
+jobs:
+  sync:
+    if: github.event.repository.fork
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push commits that touch .github/workflows; SYNC_TOKEN (PAT with workflow scope) can.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge latest upstream release
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh release view -R "$UPSTREAM" --json tagName --jq .tagName)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$tag:refs/upstream-release"
+
+          if git merge-base --is-ancestor refs/upstream-release HEAD; then
+            echo "Already contains $tag."
+            exit 0
+          fi
+
+          if git merge --no-edit -m "Merge upstream release $tag" refs/upstream-release; then
+            git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open conflict issue
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.merge.outputs.tag }}
+        run: |
+          title="Upstream release $TAG has merge conflicts"
+          if [ -n "$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[].number')" ]; then
+            echo "Issue already open."
+            exit 0
+          fi
+          {
+            echo "Merging [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) into \`${{ github.event.repository.default_branch }}\` conflicts in:"
+            echo
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+            echo
+            echo "Resolve locally:"
+            echo
+            echo '```sh'
+            echo "git fetch upstream --tags && git merge $TAG"
+            echo '```'
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "$RUNNER_TEMP/body.md"
+          gh issue create --title "$title" --body-file "$RUNNER_TEMP/body.md"
