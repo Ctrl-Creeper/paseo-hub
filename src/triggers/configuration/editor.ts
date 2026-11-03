@@ -36,6 +36,8 @@ export interface TriggerFormValue {
   maxRuntime: string;
   idleTimeout: string;
   githubConnection: string;
+  /** "app" or "account"; see `GitHubIdentity`. */
+  githubIdentity: string;
   githubRepositories: string;
   githubPermissions: string;
   githubDuration: string;
@@ -96,6 +98,7 @@ function toFormValue(
     maxRuntime: trigger.run.max_runtime,
     idleTimeout: trigger.run.idle_timeout,
     githubConnection: trigger.run.github?.connection ?? "",
+    githubIdentity: githubIdentity(trigger.run.github),
     githubRepositories: trigger.run.github?.repositories?.join(", ") ?? "",
     githubPermissions:
       trigger.run.github?.permissions === undefined
@@ -256,9 +259,15 @@ function recurrenceErrors(value: TriggerFormValue): TriggerFieldErrors {
   return parsed.success ? {} : { recurrence: parsed.error.issues[0]!.message };
 }
 
+function githubIdentity(github: { identity?: string | undefined } | undefined): string {
+  return github?.identity ?? "app";
+}
+
 function githubAuthority(value: TriggerFormValue) {
   const connection = blankToUndefined(value.githubConnection);
   if (connection === undefined) return undefined;
+  // The personal token can't be restricted, so the restriction fields are not written.
+  if (value.githubIdentity === "account") return { connection, identity: "account" as const };
   const repositories = commaSeparated(value.githubRepositories);
   const permissions = parsePermissions(value.githubPermissions);
   const duration = blankToUndefined(value.githubDuration);
@@ -327,7 +336,7 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   if (value.mode.trim().length === 0) errors.mode = "Execution mode is required.";
   const options = refused(() => parseProviderOptions(value.providerOptions));
   if (options !== undefined) errors.providerOptions = options;
-  if (value.githubConnection.trim().length !== 0) {
+  if (value.githubConnection.trim().length !== 0 && value.githubIdentity !== "account") {
     const permissions = refused(() => parsePermissions(value.githubPermissions));
     if (permissions !== undefined) errors.githubPermissions = permissions;
   }

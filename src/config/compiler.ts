@@ -1285,7 +1285,11 @@ function validateStepEnvironmentContract(
   }
   if (github !== undefined) {
     validateGitHubAuthority(github, `trigger ${triggerName} step ${stepId} github`);
-    if (github.repositories === undefined && !triggerEvent.startsWith("github.")) {
+    if (
+      github.identity !== "account" &&
+      github.repositories === undefined &&
+      !triggerEvent.startsWith("github.")
+    ) {
       throw new Error(
         `trigger ${triggerName} step ${stepId} github.repositories is required for non-GitHub triggers; list the repositories explicitly`,
       );

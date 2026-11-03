@@ -87,8 +87,16 @@ const RESERVED_ENVIRONMENT_KEYS = new Set([
 ]);
 const INDEXED_GIT_CONFIG_KEY = /^GIT_CONFIG_(?:KEY|VALUE)_[0-9]+$/u;
 
+/**
+ * Who the step acts as. `app` mints a restricted installation token. `account` hands over the
+ * operator's personal access token (`GITHUB_PERSONAL_TOKEN`) unchanged, reaching every repository
+ * that account can, so it takes no repository or permission restrictions.
+ */
+export type GitHubIdentity = "app" | "account";
+
 export interface AuthoredGitHubAuthority {
   connection: string;
+  identity?: GitHubIdentity | undefined;
   repositories?: readonly string[] | undefined;
   permissions?: Readonly<Record<string, GitHubPermissionLevel>> | undefined;
   duration?: string | undefined;
@@ -96,6 +104,8 @@ export interface AuthoredGitHubAuthority {
 
 export interface CompiledGitHubAuthority {
   connection: string;
+  /** Absent means `app`. */
+  identity?: "account" | undefined;
   repositories?: readonly string[] | undefined;
   permissions: Readonly<Record<string, GitHubPermissionLevel>>;
   durationMs: number;
@@ -106,6 +116,7 @@ const GitHubPermissionSchema = z.enum(["read", "write", "admin"]);
 export const AuthoredGitHubAuthoritySchema = z
   .object({
     connection: z.string().regex(CONNECTION_SLUG),
+    identity: z.enum(["app", "account"]).optional(),
     repositories: z.array(z.string().regex(REPOSITORY_FULL_NAME)).min(1).optional(),
     permissions: z.record(z.string(), GitHubPermissionSchema).optional(),
     duration: z.string().min(1).optional(),
@@ -115,6 +126,7 @@ export const AuthoredGitHubAuthoritySchema = z
 export const CompiledGitHubAuthoritySchema: z.ZodType<CompiledGitHubAuthority> = z
   .object({
     connection: z.string().regex(CONNECTION_SLUG),
+    identity: z.literal("account").optional(),
     repositories: z.array(z.string().regex(REPOSITORY_FULL_NAME)).min(1).optional(),
     permissions: z.record(z.string(), GitHubPermissionSchema),
     durationMs: z.number().int().positive().max(GITHUB_MAX_DURATION_MS),
@@ -125,6 +137,21 @@ export function compileGitHubAuthority(
   value: AuthoredGitHubAuthority,
   path: string,
 ): CompiledGitHubAuthority {
+  if (value.identity === "account") {
+    for (const field of ["repositories", "permissions", "duration"] as const) {
+      if (value[field] !== undefined) {
+        throw new Error(
+          `${path}.${field}: identity account uses your personal token unchanged; it cannot be restricted, so remove ${field}`,
+        );
+      }
+    }
+    return {
+      connection: value.connection,
+      identity: "account",
+      permissions: {},
+      durationMs: GITHUB_MAX_DURATION_MS,
+    };
+  }
   validateGitHubPermissions(value.permissions ?? DEFAULT_GITHUB_PERMISSIONS, `${path}.permissions`);
   const durationMs =
     value.duration === undefined

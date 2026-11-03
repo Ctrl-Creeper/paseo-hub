@@ -323,6 +323,7 @@ describe("dynamic provider runtime", () => {
     const authority = await github.integration!.githubAuthority!.mint({
       projectId: "project",
       connectionSlug: "github",
+      identity: "app",
       repositories: ["acme/repository"],
       permissions: { contents: "write" },
     });
@@ -346,6 +347,7 @@ describe("dynamic provider runtime", () => {
         github.integration!.githubAuthority!.mint({
           projectId: "project",
           connectionSlug: "github",
+          identity: "app",
           repositories: ["acme/repository"],
           permissions: { contents: "read" },
         }),
@@ -412,6 +414,7 @@ describe("dynamic provider runtime", () => {
     const authority = await stable.integration!.githubAuthority!.mint({
       projectId: "project",
       connectionSlug: "github",
+      identity: "app",
       repositories: ["acme/repository"],
       permissions: { contents: "write" },
     });

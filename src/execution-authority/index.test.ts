@@ -118,6 +118,7 @@ describe("Hub execution authority", () => {
       {
         projectId: "project-1",
         connectionSlug: "getpaseo-github",
+        identity: "app",
         repositories: ["getpaseo/paseo", "getpaseo/hub"],
         permissions: { contents: "write", pull_requests: "write", issues: "read" },
       },

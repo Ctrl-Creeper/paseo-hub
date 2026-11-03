@@ -180,7 +180,12 @@ export function createExecutionAuthority(
         const github = await options.githubAuthority.mint({
           projectId: input.projectId,
           connectionSlug: input.github.connection,
-          repositories: repositoriesForAuthority(input.github, input.triggerContext),
+          identity: input.github.identity ?? "app",
+          // A personal token can't be scoped, so there is no repository list to derive.
+          repositories:
+            input.github.identity === "account"
+              ? []
+              : repositoriesForAuthority(input.github, input.triggerContext),
           permissions: input.github.permissions,
         });
         await register(

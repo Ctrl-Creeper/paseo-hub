@@ -4,6 +4,10 @@
 
 ### Added
 
+- A workflow step can act as the operator's own GitHub account with `github.identity: account`, using `GITHUB_PERSONAL_TOKEN`, so agents commit and comment as that account on repositories the App cannot be installed on. `identity: app` stays the default; the trigger editor offers the choice as Act as. `${{ paseo.connections.<slug>.account_token }}` exposes the same token. See [docs/personal-github-account.md](docs/personal-github-account.md).
+- `GITHUB_NOTIFY_IMAP_URL` triggers workflows from GitHub notification emails forwarded to an IMAP mailbox. Each email is confirmed against the account's notifications and its content fetched from GitHub before it enters the trigger pipeline; repositories the App already delivers by webhook are skipped.
+- Hub's replies and reactions use the App on repositories it is installed on and the personal account elsewhere. Comments Hub posts as the account carry a hidden marker and never start another run.
+
 - `github.pull_request_synchronized` triggers a workflow when new commits are pushed to a pull request, with the pushed head SHA in the agent context.
 - The GitHub `exclude_contains` filter skips an event whose text contains the given string, so a general mention trigger can leave a command such as `@bot review` to the trigger that owns it.
 - `github.pull_request_ready_for_review` triggers a workflow when a draft pull request is marked ready for review, without running on creation or later pushes. GitHub pull request deliveries expose the draft status and head SHA in the agent context for revision checks.

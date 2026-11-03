@@ -170,6 +170,7 @@ describe("trigger form YAML bridge", () => {
       maxRuntime: "2h",
       idleTimeout: "10m",
       githubConnection: "",
+      githubIdentity: "app",
       githubRepositories: "",
       githubPermissions: "",
       githubDuration: "1h",
@@ -209,6 +210,7 @@ describe("trigger form YAML bridge", () => {
       maxRuntime: "2h",
       idleTimeout: "10m",
       githubConnection: "",
+      githubIdentity: "app",
       githubRepositories: "",
       githubPermissions: "",
       githubDuration: "1h",
@@ -320,6 +322,27 @@ describe("what the form still needs", () => {
         githubPermissions: '{"a":1}',
       }).githubPermissions,
     ).toBe('GitHub permissions map a scope to "read", "write", or "admin".');
+  });
+
+  test("writes only the connection and identity when acting as the personal account", () => {
+    const value = {
+      ...editable(),
+      githubConnection: "company",
+      githubIdentity: "account",
+      githubRepositories: "acme/app",
+      githubPermissions: "{",
+    };
+    expect(triggerFormErrors(value).githubPermissions).toBeUndefined();
+    const merged = mergeTriggerForm(ADVANCED, value);
+    if (merged.status !== "ok") throw new Error(merged.reason);
+    expect(parseDocument(merged.yaml).toJS() as unknown).toMatchObject({
+      run: { github: { connection: "company", identity: "account" } },
+    });
+    expect(merged.yaml).not.toMatch(/repositories|permissions|duration/u);
+
+    const projected = projectTriggerForm(merged.yaml);
+    if (projected.status !== "editable") throw new Error(projected.reason);
+    expect(projected.value.githubIdentity).toBe("account");
   });
 
   test("reports the topmost problem when the document cannot be written at all", () => {

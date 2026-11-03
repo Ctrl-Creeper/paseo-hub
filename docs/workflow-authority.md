@@ -36,6 +36,11 @@ github:
   duration: 1h
 ```
 
+`identity` chooses who the step acts as. `app`, the default, is the restricted installation token
+described below. `account` hands over the Hub's personal access token instead and accepts no
+`repositories`, `permissions`, or `duration`; see
+[acting as your own GitHub account](personal-github-account.md).
+
 `connection` is the configured connection slug. It must be active and belong to
 the execution project's organization. `repositories` uses GitHub's repository
 scope and accepts full `owner/name` values whose owner must match the selected

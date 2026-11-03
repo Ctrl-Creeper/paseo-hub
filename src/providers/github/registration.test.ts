@@ -347,6 +347,7 @@ describe("GitHub registration", () => {
     const minted = await authority.mint({
       projectId: "project-1",
       connectionSlug: "getpaseo-github",
+      identity: "app",
       repositories: ["getpaseo/paseo", "getpaseo/hub"],
       permissions: { contents: "write", pull_requests: "read" },
     });
@@ -372,6 +373,7 @@ describe("GitHub registration", () => {
         authority.mint({
           projectId: "project-1",
           connectionSlug: "getpaseo-github",
+          identity: "app",
           repositories: ["other-owner/paseo"],
           permissions: { contents: "read" },
         }),
@@ -383,6 +385,7 @@ describe("GitHub registration", () => {
     const caseInsensitive = await authority.mint({
       projectId: "project-1",
       connectionSlug: "getpaseo-github",
+      identity: "app",
       repositories: ["GETPASEO/private"],
       permissions: { contents: "read" },
     });
@@ -399,6 +402,7 @@ describe("GitHub registration", () => {
         authority.mint({
           projectId: "project-1",
           connectionSlug: "getpaseo-github",
+          identity: "app",
           repositories: ["getpaseo/hub"],
           permissions: { contents: "read" },
         }),
@@ -414,10 +418,104 @@ describe("GitHub registration", () => {
         authority.mint({
           projectId: "project-2",
           connectionSlug: "getpaseo-github",
+          identity: "app",
           repositories: ["getpaseo/paseo"],
           permissions: { contents: "read" },
         }),
       /connection is unavailable/u,
+    );
+  });
+
+  it("lets each step choose the App or the personal account", async () => {
+    const database = createMemoryDatabase();
+    database.findProjectById = async (projectId) => testProject(projectId, "org_1");
+    database.organizationConnectionUsage = async (_organizationId) => ({
+      github: [
+        {
+          id: "github-connection",
+          organizationId: "org_1",
+          slug: "getpaseo-github",
+          installationId: 142,
+          accountId: "501",
+          accountLogin: "getpaseo",
+          accountType: "Organization",
+          status: "active",
+          providerApplicationId: "42",
+        },
+      ],
+      discord: [],
+      slack: [],
+      linear: [],
+    });
+    const appAuth = {
+      getInstallation: () => Promise.resolve(undefined),
+      getInstallationToken: () => Promise.resolve("token"),
+      mintInstallationToken: () =>
+        Promise.resolve({ token: "app-token", expiresAt: Date.now() + 3_600_000 }),
+      mintInstallationAccessToken: () =>
+        Promise.resolve({ token: "scoped-token", expiresAt: Date.now() + 3_600_000 }),
+      getAppBotIdentity: () => Promise.resolve({ id: 123, login: "paseo[bot]" }),
+      revokeInstallationToken: () => Promise.resolve(),
+      createInstallationOctokit: () => Promise.reject(new Error("unused")),
+    };
+    const reactionClient = {
+      createReaction: () => Promise.resolve({ id: 1 }),
+      deleteReaction: () => Promise.resolve(),
+    };
+    const shared = {
+      database,
+      auth: null,
+      applicationBaseUrl: "https://hub.test",
+      publicBaseUrl: "https://hub.test",
+      configuration: githubConfiguration(),
+      appAuth,
+      connectionClient: new GitHubClientFake(),
+      reactionClient,
+    };
+    const step = {
+      projectId: "project-1",
+      connectionSlug: "getpaseo-github",
+      repositories: [],
+      permissions: {},
+    };
+    const withAccount = createGitHubRegistration({
+      ...shared,
+      personal: { token: "ghp_personal" },
+      fetch: () => Promise.resolve(Response.json({ id: 7, login: "octocat" })),
+    });
+    const authority = withAccount.integration?.githubAuthority;
+    assert.ok(authority);
+
+    const app = await authority.mint({
+      ...step,
+      identity: "app",
+      repositories: ["getpaseo/hub"],
+      permissions: { contents: "read" },
+    });
+    assert.equal(app.token, "scoped-token");
+    assert.equal(app.botLogin, "paseo[bot]");
+
+    const account = await authority.mint({ ...step, identity: "account" });
+    assert.equal(account.token, "ghp_personal");
+    assert.equal(account.botUserId, 7);
+    assert.equal(account.botLogin, "octocat");
+    assert.equal(
+      await withAccount.integration!.resolve("project-1", "getpaseo-github", "token"),
+      "app-token",
+    );
+    assert.equal(
+      await withAccount.integration!.resolve("project-1", "getpaseo-github", "account_token"),
+      "ghp_personal",
+    );
+
+    const appOnly = createGitHubRegistration({ ...shared, personal: null });
+    await assert.rejects(
+      () => appOnly.integration!.githubAuthority!.mint({ ...step, identity: "account" }),
+      /GITHUB_PERSONAL_TOKEN/u,
+    );
+    await assert.rejects(
+      () => appOnly.integration!.resolve("project-1", "getpaseo-github", "account_token"),
+      /GITHUB_PERSONAL_TOKEN/u,
     );
   });
 

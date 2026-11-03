@@ -5,7 +5,7 @@ import {
   type TriggerProviderMatch,
   type TriggerProviderReactionState,
 } from "../index.js";
-import type { GitHubAuth } from "../../auth/github.js";
+import type { Octokit } from "octokit";
 import {
   agentFailureNotice,
   isExecutionLimitDenial,
@@ -78,14 +78,15 @@ interface GitHubContextItem {
   author: { login: string } | null;
 }
 
-export function createGitHubReactionClient(
-  auth: Pick<GitHubAuth, "createInstallationOctokit">,
-): GitHubReactionClient {
+export function createGitHubReactionClient(auth: {
+  /** The client to react with for this installation and `owner/name` repository. */
+  octokitFor(installationId: number, repository: string): Promise<Octokit>;
+}): GitHubReactionClient {
   return {
     async createReaction(input) {
       try {
         const [owner, repo] = splitRepo(input.repo);
-        const octokit = await auth.createInstallationOctokit(input.installationId);
+        const octokit = await auth.octokitFor(input.installationId, input.repo);
         if (input.subject.kind === "item") {
           const response = await octokit.request(
             "POST /repos/{owner}/{repo}/issues/{issue_number}/reactions",
@@ -115,7 +116,7 @@ export function createGitHubReactionClient(
     async deleteReaction(input) {
       try {
         const [owner, repo] = splitRepo(input.repo);
-        const octokit = await auth.createInstallationOctokit(input.installationId);
+        const octokit = await auth.octokitFor(input.installationId, input.repo);
         if (input.subject.kind === "item") {
           await octokit.request(
             "DELETE /repos/{owner}/{repo}/issues/{issue_number}/reactions/{reaction_id}",

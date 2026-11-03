@@ -369,7 +369,9 @@ describe("durable multi-step workflow engine", () => {
         configurationStoreForProject: () => {
           throw new Error("not used for terminal delivery");
         },
-        reactions: createGitHubReactionClient(auth),
+        reactions: createGitHubReactionClient({
+          octokitFor: (installationId) => auth.createInstallationOctokit(installationId),
+        }),
       });
       const context: GitHubTriggerContext = {
         provider: "github",

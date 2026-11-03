@@ -393,6 +393,26 @@ describe("workflow compiler", () => {
     );
   });
 
+  it("compiles a personal-account step without repository or permission restrictions", () => {
+    const base = configuration();
+    const step = base.triggers[0]!.steps[0]!;
+    const compiled = compileHubConfig({
+      ...base,
+      triggers: [
+        {
+          ...base.triggers[0],
+          steps: [{ ...step, github: { connection: "getpaseo-github", identity: "account" } }],
+        },
+      ],
+    });
+    assert.deepEqual(compiled.triggers[0]!.steps[0]!.github, {
+      connection: "getpaseo-github",
+      identity: "account",
+      permissions: {},
+      durationMs: 3_600_000,
+    });
+  });
+
   it("rejects GitHub authority values that could expand beyond authored scope", () => {
     const base = configuration();
     const step = base.triggers[0]!.steps[0]!;
@@ -420,6 +440,22 @@ describe("workflow compiler", () => {
           duration: "2h",
         },
         expected: /github\.duration.*must not exceed 1h/iu,
+      },
+      {
+        github: {
+          connection: "getpaseo-github",
+          identity: "account",
+          repositories: ["getpaseo/paseo"],
+        },
+        expected: /github\.repositories.*identity account.*cannot be restricted/iu,
+      },
+      {
+        github: {
+          connection: "getpaseo-github",
+          identity: "account",
+          permissions: { contents: "read" },
+        },
+        expected: /github\.permissions.*identity account/iu,
       },
     ] as const;
 

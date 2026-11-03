@@ -358,7 +358,9 @@ describe("GitHub Phase 1 trigger provider", () => {
     const auth = {
       createInstallationOctokit: async () => octokit,
     } satisfies Pick<GitHubAuth, "createInstallationOctokit">;
-    const reactions = createGitHubReactionClient(auth);
+    const reactions = createGitHubReactionClient({
+      octokitFor: () => auth.createInstallationOctokit(),
+    });
     const subject = { kind: "item" as const, issueNumber: 312 };
 
     await reactions.createReaction({

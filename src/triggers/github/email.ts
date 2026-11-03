@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { ImapFlow } from "imapflow";
+import { z } from "zod";
 import type { Octokit } from "octokit";
 import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
 import type { ProviderEventAcceptance } from "../../db/types.js";
 import { logger } from "../../logger.js";
 import { logProviderEventIntake } from "../audit.js";
+import type { ProviderEventDropReasonCode } from "../drop-reason.js";
 import type { TriggerHandler, TriggerSource } from "../index.js";
 
 /**
@@ -24,12 +26,14 @@ export type NotificationRef =
 // <owner/repo/issues/12@github.com>, <owner/repo/pull/12/c345@github.com>,
 // <owner/repo/issues/12/345@github.com>, <owner/repo/pull/12/review/678@github.com>
 const MESSAGE_ID =
-  /^<?([^/\s<>]+)\/([^/\s<>]+)\/(issues|pull)\/(\d+)(?:\/c?(\d+)|\/review\/(\d+))?@github\.com>?$/u;
+  /^<?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(issues|pull)\/(\d+)(?:\/c?(\d+)|\/review\/(\d+))?@github\.com>?$/u;
 
 export function parseNotificationMessageId(messageId: string): NotificationRef | undefined {
   const match = MESSAGE_ID.exec(messageId.trim());
   if (match === null) return undefined;
   const [, owner, repo, type, number, commentId, reviewId] = match;
+  // "." and ".." would turn the API path into a different endpoint.
+  if (/^\.+$/u.test(owner!) || /^\.+$/u.test(repo!)) return undefined;
   const base = { owner: owner!, repo: repo!, number: Number(number) };
   if (commentId !== undefined) return { kind: "comment", ...base, commentId: Number(commentId) };
   if (reviewId !== undefined) {
@@ -48,16 +52,28 @@ export async function githubNotified(
   octokit: Pick<Octokit, "request">,
   ref: NotificationRef,
   now: number = Date.now(),
+  /** When the email was sent; the thread was updated no earlier than shortly before it. */
+  sentAt?: Date,
 ): Promise<boolean> {
-  const threads = await octokit.request("GET /repos/{owner}/{repo}/notifications", {
-    owner: ref.owner,
-    repo: ref.repo,
-    all: true,
-    since: new Date(now - NOTIFIED_WITHIN_MS).toISOString(),
-    per_page: 50,
-  });
+  const earliest = now - NOTIFIED_WITHIN_MS;
+  const sent = sentAt?.getTime();
+  const since =
+    sent === undefined || Number.isNaN(sent) ? earliest : Math.max(earliest, sent - 10 * 60_000);
   const subject = new RegExp(`/(?:issues|pulls)/${ref.number}$`, "u");
-  return threads.data.some((thread) => subject.test(thread.subject.url ?? ""));
+  // ponytail: up to 500 threads; a repository busier than that within the window is out of scope.
+  for (let page = 1; page <= 10; page += 1) {
+    const threads = await octokit.request("GET /repos/{owner}/{repo}/notifications", {
+      owner: ref.owner,
+      repo: ref.repo,
+      all: true,
+      since: new Date(since).toISOString(),
+      per_page: 50,
+      page,
+    });
+    if (threads.data.some((thread) => subject.test(thread.subject.url ?? ""))) return true;
+    if (threads.data.length < 50) return false;
+  }
+  return false;
 }
 
 /**
@@ -179,6 +195,8 @@ export async function eventForNotification(
 export interface EmailSourceOptions {
   /** imaps://user:pass@host:993 — the mailbox Gmail forwards GitHub notifications into. */
   imapUrl: string;
+  /** Repositories the App is installed on already deliver webhooks; their emails are skipped. */
+  appInstalled(repositoryId: number): Promise<boolean>;
   installationId: number;
   octokit: Pick<Octokit, "request">;
   accept(input: {
@@ -190,35 +208,60 @@ export interface EmailSourceOptions {
     repo: string;
     payload: unknown;
     receivedAt: Date;
+    dropReason?: ProviderEventDropReasonCode;
   }): Promise<ProviderEventAcceptance>;
 }
 
-const RECONNECT_MS = 30_000;
+const RECONNECT_MIN_MS = 30_000;
+const RECONNECT_MAX_MS = 15 * 60_000;
+
+/**
+ * Whether retrying can't help: the content is gone, never existed, or is forbidden. Rate limits
+ * (429, and 403 with no remaining quota) are transient and stay unread for a later drain.
+ */
+const GitHubFailureSchema = z.object({
+  status: z.number(),
+  response: z.object({ headers: z.record(z.string(), z.unknown()).optional() }).optional(),
+});
+
+export function permanentGitHubFailure(error: unknown): boolean {
+  const parsed = GitHubFailureSchema.safeParse(error);
+  if (!parsed.success) return false;
+  const { status, response } = parsed.data;
+  if (status < 400 || status >= 500 || status === 429) return false;
+  return status !== 403 || response?.headers?.["x-ratelimit-remaining"] !== "0";
+}
 
 export function createEmailSource(options: EmailSourceOptions): TriggerSource {
   const handlers = new Set<TriggerHandler>();
   const url = new URL(options.imapUrl);
-  if (url.protocol !== "imaps:" && url.protocol !== "imap:") {
-    throw new Error("GITHUB_NOTIFY_IMAP_URL must use imaps:// or imap://");
+  // The URL carries the mailbox password, so it is never sent in clear.
+  if (url.protocol !== "imaps:") {
+    throw new Error("GITHUB_NOTIFY_IMAP_URL must use imaps://");
   }
   let client: ImapFlow | undefined;
   let stopped = true;
   let reconnect: NodeJS.Timeout | undefined;
+  let reconnectDelay = RECONNECT_MIN_MS;
   let draining: Promise<void> = Promise.resolve();
 
-  async function handleMessage(messageId: string): Promise<void> {
+  async function handleMessage(messageId: string, sentAt: Date | undefined): Promise<void> {
     const ref = parseNotificationMessageId(messageId);
     if (ref === undefined) {
       logger.debug({ messageId }, "skipping email that is not a supported GitHub notification");
       return;
     }
-    if (!(await githubNotified(options.octokit, ref))) {
+    if (!(await githubNotified(options.octokit, ref, Date.now(), sentAt))) {
       logger.warn({ messageId }, "dropping email with no matching GitHub notification");
       return;
     }
     const event = await eventForNotification(options.octokit, ref, options.installationId);
     if (event === undefined) {
       logger.warn({ messageId }, "dropping email whose content is stale or belongs elsewhere");
+      return;
+    }
+    if (await options.appInstalled(event.repositoryId)) {
+      logger.debug({ messageId }, "skipping email for a repository the App delivers by webhook");
       return;
     }
     const deliveryId = event.id;
@@ -232,6 +275,8 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
       repo: event.repo,
       payload: event,
       receivedAt: new Date(event.createdAt),
+      // Accepted with no handler would never start a run; record why instead.
+      ...(handlers.size === 0 ? { dropReason: "configuration_unavailable" as const } : {}),
     });
     logProviderEventIntake({
       provider: "github",
@@ -247,18 +292,29 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
     );
   }
 
-  /** Processes every unseen message. A message stays unseen when handling fails, so it retries. */
+  /**
+   * Processes every unseen message. A transient failure leaves it unseen so a later drain retries;
+   * a permanent one (deleted or forged content) marks it seen so it can't be replayed forever.
+   */
   async function drain(imap: ImapFlow): Promise<void> {
     const uids = (await imap.search({ seen: false }, { uid: true })) || [];
     for (const uid of uids) {
-      const message = await imap.fetchOne(String(uid), { envelope: true }, { uid: true });
-      if (message === false) continue;
+      if (stopped) return;
+      const range = String(uid);
       try {
+        const message = await imap.fetchOne(range, { envelope: true }, { uid: true });
+        if (message === false) continue;
         const messageId = message.envelope?.messageId;
-        if (messageId !== undefined) await handleMessage(messageId);
-        await imap.messageFlagsAdd(String(uid), ["\\Seen"], { uid: true });
+        if (messageId !== undefined)
+          await handleMessage(messageId, sentDate(message.envelope?.date));
+        await imap.messageFlagsAdd(range, ["\\Seen"], { uid: true });
       } catch (error) {
-        logger.warn({ err: error, uid }, "github notification email failed; will retry");
+        if (!permanentGitHubFailure(error)) {
+          logger.warn({ err: error, uid }, "github notification email failed; will retry");
+          continue;
+        }
+        logger.warn({ err: error, uid }, "dropping github notification email GitHub refused");
+        await imap.messageFlagsAdd(range, ["\\Seen"], { uid: true }).catch(() => undefined);
       }
     }
   }
@@ -273,8 +329,8 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
     if (stopped) return;
     const imap = new ImapFlow({
       host: url.hostname,
-      port: Number(url.port || (url.protocol === "imaps:" ? 993 : 143)),
-      secure: url.protocol === "imaps:",
+      port: Number(url.port || 993),
+      secure: true,
       auth: { user: decodeURIComponent(url.username), pass: decodeURIComponent(url.password) },
       logger: false,
     });
@@ -283,8 +339,12 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
       logger.warn({ err: error }, "github notification imap error"),
     );
     imap.on("close", () => {
-      if (client === imap) client = undefined;
-      if (!stopped) reconnect = setTimeout(() => void connect(), RECONNECT_MS);
+      // Only the current connection reconnects, so a stop and start can't leave two running.
+      if (client !== imap) return;
+      client = undefined;
+      if (stopped) return;
+      reconnect = setTimeout(() => void connect(), reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
     });
     // The server announces new mail while imapflow idles on the selected mailbox.
     imap.on("exists", () => scheduleDrain(imap));
@@ -292,9 +352,13 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
       await imap.connect();
       await imap.mailboxOpen("INBOX");
       logger.info({ host: url.hostname }, "listening for github notification emails");
+      reconnectDelay = RECONNECT_MIN_MS;
       scheduleDrain(imap);
     } catch (error) {
-      logger.warn({ err: error }, "github notification imap connect failed");
+      logger.error(
+        { err: error, retryInMs: reconnectDelay },
+        "github notification imap connect failed; check GITHUB_NOTIFY_IMAP_URL",
+      );
       imap.close();
     }
   }
@@ -317,4 +381,10 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
       await imap?.logout().catch(() => imap.close());
     },
   };
+}
+
+function sentDate(value: Date | string | undefined): Date | undefined {
+  if (value === undefined) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
 }

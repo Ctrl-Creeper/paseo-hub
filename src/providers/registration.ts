@@ -34,6 +34,7 @@ export interface GitHubAuthorityRegistration {
   mint(input: {
     projectId: string;
     connectionSlug: string;
+    identity: "app" | "account";
     repositories: readonly string[];
     permissions: Readonly<Record<string, "read" | "write" | "admin">>;
   }): Promise<{

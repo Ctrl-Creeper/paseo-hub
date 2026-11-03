@@ -540,6 +540,7 @@ describe("daemon enrollment and execution", () => {
       {
         projectId: "00000000-0000-4000-8000-000000000001",
         connectionSlug: "getpaseo-github",
+        identity: "app",
         repositories: ["getpaseo/paseo"],
         permissions: { contents: "write", pull_requests: "write" },
       },

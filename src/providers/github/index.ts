@@ -42,6 +42,7 @@ import type { ProjectConfigurationStore } from "../../configuration/store.js";
 import { replyOutputTool } from "../../execution-capabilities/outputs.js";
 import { createGitHubReplyExecutor, githubReplyAvailable } from "../../triggers/github/reply.js";
 import { createEmailSource } from "../../triggers/github/email.js";
+import { HUB_AUTHORED_MARKER } from "../../triggers/github/classification.js";
 import {
   createPersonalGitHubAccount,
   readPersonalGitHubEnvironment,
@@ -170,13 +171,18 @@ export function createGitHubRegistration(
       );
     },
   });
-  const reactions =
-    options.reactionClient ??
-    createGitHubReactionClient(
-      personal === undefined
-        ? appAuth
-        : { createInstallationOctokit: () => Promise.resolve(personal.octokit) },
+  /**
+   * Hub's own replies and reactions go through the App where it is installed on the repository,
+   * and through the personal account everywhere else, such as repositories reached by email.
+   */
+  async function octokitFor(installationId: number, repository: string) {
+    if (personal === undefined) return appAuth.createInstallationOctokit(installationId);
+    const installed = await appInstalled(database, installationId, (candidate) =>
+      sameRepository(candidate.fullName, repository),
     );
+    return installed ? appAuth.createInstallationOctokit(installationId) : personal.octokit;
+  }
+  const reactions = options.reactionClient ?? createGitHubReactionClient({ octokitFor });
   const comments = {
     async createIssueComment(input: {
       installationId: number;
@@ -185,13 +191,13 @@ export function createGitHubRegistration(
       issueNumber: number;
       body: string;
     }) {
-      const octokit =
-        personal?.octokit ?? (await appAuth.createInstallationOctokit(input.installationId));
+      const octokit = await octokitFor(input.installationId, `${input.owner}/${input.repo}`);
+      const asAccount = octokit === personal?.octokit;
       await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
         owner: input.owner,
         repo: input.repo,
         issue_number: input.issueNumber,
-        body: input.body,
+        body: asAccount ? `${input.body}\n\n${HUB_AUTHORED_MARKER}` : input.body,
       });
     },
   };
@@ -207,7 +213,7 @@ export function createGitHubRegistration(
     connection,
     integration: {
       async resolve(projectId, connectionSlug, value, context?: ConnectionResolutionContext) {
-        if (value !== "token") {
+        if (value !== "token" && value !== "account_token") {
           throw new Error(`unsupported github integration value: ${value}`);
         }
         const project = await database.findProjectById(projectId);
@@ -222,9 +228,13 @@ export function createGitHubRegistration(
         if (selectedConnection === undefined || selectedConnection.status !== "active") {
           throw new Error(`github connection is unavailable: ${connectionSlug}`);
         }
+        if (value === "account_token" && personal === undefined) {
+          throw new Error("account_token requires GITHUB_PERSONAL_TOKEN on the Hub");
+        }
         const token =
-          personal?.lease() ??
-          (await appAuth.mintInstallationToken(selectedConnection.installationId));
+          value === "account_token" && personal !== undefined
+            ? personal.lease()
+            : await appAuth.mintInstallationToken(selectedConnection.installationId);
         await context?.registerToken?.({
           provider: "github",
           token: token.token,
@@ -246,7 +256,10 @@ export function createGitHubRegistration(
           if (selectedConnection === undefined || selectedConnection.status !== "active") {
             throw new Error(`github connection is unavailable: ${input.connectionSlug}`);
           }
-          if (personal !== undefined) {
+          if (input.identity === "account") {
+            if (personal === undefined) {
+              throw new Error("github identity account requires GITHUB_PERSONAL_TOKEN on the Hub");
+            }
             const account = await personal.identity();
             return { ...personal.lease(), botUserId: account.id, botLogin: account.login };
           }
@@ -272,7 +285,7 @@ export function createGitHubRegistration(
         },
         // Hub never revokes the personal token; only the operator can.
         revoke: (token) =>
-          token === personal?.token ? Promise.resolve() : appAuth.revokeInstallationToken(token),
+          isPersonalToken(token) ? Promise.resolve() : appAuth.revokeInstallationToken(token),
       },
     },
     triggerProviders: [
@@ -331,6 +344,12 @@ function createPersonalGitHub(
           imapUrl: environment.imapUrl,
           installationId: environment.installationId,
           octokit: personal.octokit,
+          appInstalled: (repositoryId) =>
+            appInstalled(
+              database,
+              environment.installationId!,
+              (candidate) => candidate.repositoryId === repositoryId,
+            ),
           accept: (input) =>
             database.acceptGitHubEvent({
               ...input,
@@ -339,6 +358,31 @@ function createPersonalGitHub(
             }),
         });
   return { personal, email };
+}
+
+/** Whether the App installation behind `installationId` covers a repository matching `match`. */
+async function appInstalled(
+  database: Database,
+  installationId: number,
+  match: (repository: { repositoryId: number; fullName: string }) => boolean,
+): Promise<boolean> {
+  const installation = await database.findGitHubConnection(installationId);
+  if (installation === undefined) return false;
+  return (await database.listGitHubRepositories(installation.organizationId)).some(
+    (candidate) => candidate.connectionId === installation.id && match(candidate),
+  );
+}
+
+function sameRepository(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+/**
+ * A personal token (`ghp_`, `github_pat_`) is the operator's to revoke, including one from before
+ * a rotation that a recovered lease still holds; Hub revokes only App installation tokens.
+ */
+function isPersonalToken(token: string): boolean {
+  return token.startsWith("ghp_") || token.startsWith("github_pat_");
 }
 
 function emptyGitHubRegistration(

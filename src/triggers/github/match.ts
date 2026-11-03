@@ -3,7 +3,7 @@ import type {
   TriggerFilter,
 } from "../../config/index.js";
 import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
-import { classifyGitHubEvent } from "./classification.js";
+import { classifyGitHubEvent, HUB_AUTHORED_MARKER } from "./classification.js";
 
 type MatchedTriggerDefinition = Pick<CompiledTrigger, "name" | "on" | "filters">;
 
@@ -88,7 +88,7 @@ function matchesFilter(
     return false;
   }
 
-  if (!matchesText(classified.text, filter)) {
+  if (classified.text.includes(HUB_AUTHORED_MARKER) || !matchesText(classified.text, filter)) {
     return false;
   }
 

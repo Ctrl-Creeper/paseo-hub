@@ -7,6 +7,12 @@ import {
 } from "../../auth/github-events.js";
 import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
 
+/**
+ * Appended to comments Hub posts as the personal account. They look like the operator's own, so
+ * without it a reply that matches its trigger would start another run, and so on forever.
+ */
+export const HUB_AUTHORED_MARKER = "<!-- paseo-hub -->";
+
 export const GITHUB_SEMANTIC_TRIGGER_EVENT_NAMES = [
   "github.issue_created",
   "github.pull_request_created",

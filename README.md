@@ -137,6 +137,12 @@ event-native `reply` tool for progress and final responses. Provider or machine 
 controls every unrelated tool. A read-only provider configuration is defense in depth; Hub output
 authorization remains enforced by the execution MCP server.
 
+## Your own GitHub account
+
+Steps can act as your own GitHub account instead of the App, and Hub can trigger from the
+notification emails GitHub sends you, for repositories you contribute to but cannot install the App
+on. See [acting as your own GitHub account](docs/personal-github-account.md).
+
 ## Scheduled triggers
 
 Choose Schedule in the trigger editor to run agents daily or on selected weekdays, at one or more

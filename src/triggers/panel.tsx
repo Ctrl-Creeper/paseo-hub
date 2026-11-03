@@ -597,6 +597,7 @@ function TriggerForm({
     })),
   ];
   const githubEnabled = form.githubConnection !== "";
+  const githubAsAccount = form.githubIdentity === "account";
   const [githubExpanded, setGithubExpanded] = useState(githubEnabled);
   const [optionsExpanded, setOptionsExpanded] = useState(false);
   const everyone = form.allowedUsers.trim() === "*";
@@ -904,13 +905,13 @@ function TriggerForm({
                 open={githubExpanded}
                 onOpenChange={setGithubExpanded}
                 title="GitHub access"
-                description="Give the run a short-lived token scoped to the repositories you name."
+                description="Give the run a GitHub token, as the App or as your own account."
               >
                 <div className="grid gap-4 sm:grid-cols-2">
                   <FormField
                     id="trigger-github-connection"
                     label="GitHub connection"
-                    description="Mints a short-lived, restricted GH_TOKEN for this run."
+                    description="The connection the run's GH_TOKEN belongs to."
                   >
                     {(control) => (
                       <Combobox
@@ -924,6 +925,14 @@ function TriggerForm({
                     )}
                   </FormField>
                   {githubEnabled ? (
+                    <SegmentedControl
+                      label="Act as"
+                      value={form.githubIdentity}
+                      onChange={text("githubIdentity")}
+                      options={GITHUB_IDENTITY_OPTIONS}
+                    />
+                  ) : null}
+                  {githubEnabled && !githubAsAccount ? (
                     <>
                       <FormField
                         id="trigger-github-repositories"
@@ -975,6 +984,19 @@ function TriggerForm({
     </div>
   );
 }
+
+const GITHUB_IDENTITY_OPTIONS: readonly SegmentedOption[] = [
+  {
+    value: "app",
+    label: "GitHub App",
+    hint: "A short-lived token limited to the repositories and permissions you name. Commits come from the App's bot.",
+  },
+  {
+    value: "account",
+    label: "My account",
+    hint: "The Hub's personal access token, unrestricted: anything your account can do. Commits come from you.",
+  },
+];
 
 const AUDIENCE_OPTIONS: readonly SegmentedOption[] = [
   { value: "everyone", label: "Everyone" },
@@ -1277,6 +1299,7 @@ function defaultForm(snapshot: TriggerSnapshot): TriggerFormValue {
     maxRuntime: "2h",
     idleTimeout: "10m",
     githubConnection: "",
+    githubIdentity: "app",
     githubRepositories: "",
     githubPermissions: "",
     githubDuration: "1h",

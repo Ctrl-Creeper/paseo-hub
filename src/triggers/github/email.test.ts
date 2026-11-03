@@ -5,7 +5,10 @@ import {
   githubNotified,
   notificationDeliveryId,
   parseNotificationMessageId,
+  permanentGitHubFailure,
 } from "./email.js";
+import { HUB_AUTHORED_MARKER } from "./classification.js";
+import { matchTriggers } from "./match.js";
 
 describe("github notification emails", () => {
   it("parses the Message-ID shapes GitHub uses", () => {
@@ -104,5 +107,78 @@ describe("github notification emails", () => {
     const forged = parseNotificationMessageId("<octo/hub/issues/70/c345@github.com>")!;
     await expect(githubNotified(octokit, notified)).resolves.toBe(true);
     await expect(githubNotified(octokit, forged)).resolves.toBe(false);
+  });
+
+  it("rejects owner or repository names that would change the API path", () => {
+    expect(parseNotificationMessageId("<../hub/issues/1@github.com>")).toBeUndefined();
+    expect(parseNotificationMessageId("<octo/../issues/1@github.com>")).toBeUndefined();
+    expect(parseNotificationMessageId("<oc%2Fto/hub/issues/1@github.com>")).toBeUndefined();
+    expect(parseNotificationMessageId("<octo/hub.js/issues/1@github.com>")?.repo).toBe("hub.js");
+  });
+
+  it("drops refused content but retries rate limits and outages", () => {
+    const rateLimited = { status: 403, response: { headers: { "x-ratelimit-remaining": "0" } } };
+    expect(permanentGitHubFailure({ status: 404 })).toBe(true);
+    expect(permanentGitHubFailure({ status: 403, response: { headers: {} } })).toBe(true);
+    expect(permanentGitHubFailure(rateLimited)).toBe(false);
+    expect(permanentGitHubFailure({ status: 429 })).toBe(false);
+    expect(permanentGitHubFailure({ status: 502 })).toBe(false);
+    expect(permanentGitHubFailure(new Error("socket hang up"))).toBe(false);
+  });
+
+  it("checks notifications from shortly before the email, page by page", async () => {
+    const calls: Record<string, unknown>[] = [];
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- a route-keyed fake cannot satisfy Octokit's overloaded request type
+    const octokit = {
+      request: (_route: string, params: Record<string, unknown>) => {
+        calls.push(params);
+        const data =
+          params["page"] === 1
+            ? Array.from({ length: 50 }, (_, index) => ({
+                subject: { url: `https://api.github.com/repos/octo/hub/issues/${100 + index}` },
+              }))
+            : [{ subject: { url: "https://api.github.com/repos/octo/hub/pulls/7" } }];
+        return Promise.resolve({ data });
+      },
+    } as unknown as Parameters<typeof githubNotified>[0];
+    const ref = parseNotificationMessageId("<octo/hub/pull/7/c345@github.com>")!;
+    const now = Date.parse("2026-11-03T12:00:00Z");
+    await expect(githubNotified(octokit, ref, now, new Date("2026-11-03T11:00:00Z"))).resolves.toBe(
+      true,
+    );
+    expect(calls.map((call) => [call["page"], call["since"]])).toEqual([
+      [1, "2026-11-03T10:50:00.000Z"],
+      [2, "2026-11-03T10:50:00.000Z"],
+    ]);
+  });
+
+  it("never lets a comment Hub posted as the account start another run", () => {
+    const event = {
+      id: "delivery",
+      type: "issue_comment",
+      repo: "octo/hub",
+      repositoryId: 99,
+      installationId: 42,
+      createdAt: "2026-11-03T00:00:00Z",
+      payload: {
+        action: "created",
+        comment: { id: 1, body: `@paseo done\n\n${HUB_AUTHORED_MARKER}`, user: { login: "me" } },
+        issue: { number: 7, labels: [] },
+        sender: { login: "me" },
+      },
+    };
+    const trigger = {
+      name: "mention",
+      on: "github.issue_comment_created",
+      filters: { from_users: ["me"], contains: "@paseo" },
+    };
+    const run = (body: string) =>
+      matchTriggers(
+        // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- only the filter fields matter here
+        { triggers: [trigger] } as unknown as Parameters<typeof matchTriggers>[0],
+        { ...event, payload: { ...event.payload, comment: { ...event.payload.comment, body } } },
+      ).length;
+    expect(run("@paseo do it")).toBe(1);
+    expect(run(`@paseo done\n\n${HUB_AUTHORED_MARKER}`)).toBe(0);
   });
 });
