@@ -11,6 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: write
   contents: write
   issues: write
 
@@ -53,7 +54,7 @@ jobs:
           fi
 
       # Releases v<upstream>-N once per new main commit: -1 for the merge, -2 onward for fork commits on top.
-      # Created with GITHUB_TOKEN, so the tag does not trigger release.yml (which rejects suffixed tags).
+      # Created with GITHUB_TOKEN, so the tag starts no push run; fork-release.yml is dispatched instead.
       - name: Release fork
         if: steps.merge.outputs.conflict != 'true'
         env:
@@ -68,6 +69,8 @@ jobs:
           release="$TAG-$(( ${last:-0} + 1 ))"
           gh release view "$TAG" -R "$UPSTREAM" --json body --jq .body > "$RUNNER_TEMP/notes.md"
           gh release create "$release" --target "$(git rev-parse HEAD)" --title "Paseo Hub $release" --notes-file "$RUNNER_TEMP/notes.md" --latest
+          # The GITHUB_TOKEN tag starts no push run; dispatch the image build explicitly.
+          gh workflow run fork-release.yml --ref "${{ github.event.repository.default_branch }}" -f tag="$release"
 
       - name: Open conflict issue
         if: steps.merge.outputs.conflict == 'true'
