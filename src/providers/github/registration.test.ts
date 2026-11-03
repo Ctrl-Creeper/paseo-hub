@@ -480,7 +480,7 @@ describe("GitHub registration", () => {
     };
     const withAccount = createGitHubRegistration({
       ...shared,
-      personal: { token: "ghp_personal" },
+      personal: { token: "ghp_personal", installationId: 142 },
       fetch: () => Promise.resolve(Response.json({ id: 7, login: "octocat" })),
     });
     const authority = withAccount.integration?.githubAuthority;
@@ -506,6 +506,20 @@ describe("GitHub registration", () => {
     assert.equal(
       await withAccount.integration!.resolve("project-1", "getpaseo-github", "account_token"),
       "ghp_personal",
+    );
+
+    const otherInstallation = createGitHubRegistration({
+      ...shared,
+      personal: { token: "ghp_personal", installationId: 999 },
+      fetch: () => Promise.resolve(Response.json({ id: 7, login: "octocat" })),
+    });
+    await assert.rejects(
+      () => otherInstallation.integration!.githubAuthority!.mint({ ...step, identity: "account" }),
+      /GITHUB_PERSONAL_INSTALLATION_ID/u,
+    );
+    await assert.rejects(
+      () => otherInstallation.integration!.resolve("project-1", "getpaseo-github", "account_token"),
+      /GITHUB_PERSONAL_INSTALLATION_ID/u,
     );
 
     const appOnly = createGitHubRegistration({ ...shared, personal: null });

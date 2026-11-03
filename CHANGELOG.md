@@ -4,7 +4,7 @@
 
 ### Added
 
-- A workflow step can act as the operator's own GitHub account with `github.identity: account`, using `GITHUB_PERSONAL_TOKEN`, so agents commit and comment as that account on repositories the App cannot be installed on. `identity: app` stays the default; the trigger editor offers the choice as Act as. `${{ paseo.connections.<slug>.account_token }}` exposes the same token. See [docs/personal-github-account.md](docs/personal-github-account.md).
+- A workflow step can act as the operator's own GitHub account with `github.identity: account`, using `GITHUB_PERSONAL_TOKEN`, available only to the connection of `GITHUB_PERSONAL_INSTALLATION_ID`, so agents commit and comment as that account on repositories the App cannot be installed on. `identity: app` stays the default; the trigger editor offers the choice as Act as. `${{ paseo.connections.<slug>.account_token }}` exposes the same token. See [docs/personal-github-account.md](docs/personal-github-account.md).
 - `GITHUB_NOTIFY_IMAP_URL` triggers workflows from GitHub notification emails forwarded to an IMAP mailbox. Each email is confirmed against the account's notifications and its content fetched from GitHub before it enters the trigger pipeline; repositories the App already delivers by webhook are skipped.
 - Hub's replies and reactions use the App on repositories it is installed on and the personal account elsewhere. Comments Hub posts as the account carry a hidden marker and never start another run.
 

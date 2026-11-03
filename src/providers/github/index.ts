@@ -176,13 +176,27 @@ export function createGitHubRegistration(
    * and through the personal account everywhere else, such as repositories reached by email.
    */
   async function octokitFor(installationId: number, repository: string) {
-    if (personal === undefined) return appAuth.createInstallationOctokit(installationId);
+    if (personal === undefined || installationId !== personal.installationId) {
+      return appAuth.createInstallationOctokit(installationId);
+    }
     const installed = await appInstalled(database, installationId, (candidate) =>
       sameRepository(candidate.fullName, repository),
     );
-    return installed ? appAuth.createInstallationOctokit(installationId) : personal.octokit;
+    return installed ? appAuth.createInstallationOctokit(installationId) : personal.account.octokit;
   }
   const reactions = options.reactionClient ?? createGitHubReactionClient({ octokitFor });
+  /** The personal account, only for the connection of the installation it is bound to. */
+  function personalFor(installationId: number, feature: string) {
+    if (personal === undefined) {
+      throw new Error(`${feature} requires GITHUB_PERSONAL_TOKEN on the Hub`);
+    }
+    if (installationId !== personal.installationId) {
+      throw new Error(
+        `${feature} is only available to the connection of GITHUB_PERSONAL_INSTALLATION_ID`,
+      );
+    }
+    return personal.account;
+  }
   const comments = {
     async createIssueComment(input: {
       installationId: number;
@@ -192,7 +206,7 @@ export function createGitHubRegistration(
       body: string;
     }) {
       const octokit = await octokitFor(input.installationId, `${input.owner}/${input.repo}`);
-      const asAccount = octokit === personal?.octokit;
+      const asAccount = octokit === personal?.account.octokit;
       await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
         owner: input.owner,
         repo: input.repo,
@@ -228,13 +242,13 @@ export function createGitHubRegistration(
         if (selectedConnection === undefined || selectedConnection.status !== "active") {
           throw new Error(`github connection is unavailable: ${connectionSlug}`);
         }
-        if (value === "account_token" && personal === undefined) {
-          throw new Error("account_token requires GITHUB_PERSONAL_TOKEN on the Hub");
-        }
+        const account =
+          value === "account_token"
+            ? personalFor(selectedConnection.installationId, "account_token")
+            : undefined;
         const token =
-          value === "account_token" && personal !== undefined
-            ? personal.lease()
-            : await appAuth.mintInstallationToken(selectedConnection.installationId);
+          account?.lease() ??
+          (await appAuth.mintInstallationToken(selectedConnection.installationId));
         await context?.registerToken?.({
           provider: "github",
           token: token.token,
@@ -257,11 +271,9 @@ export function createGitHubRegistration(
             throw new Error(`github connection is unavailable: ${input.connectionSlug}`);
           }
           if (input.identity === "account") {
-            if (personal === undefined) {
-              throw new Error("github identity account requires GITHUB_PERSONAL_TOKEN on the Hub");
-            }
-            const account = await personal.identity();
-            return { ...personal.lease(), botUserId: account.id, botLogin: account.login };
+            const account = personalFor(selectedConnection.installationId, "identity account");
+            const user = await account.identity();
+            return { ...account.lease(), botUserId: user.id, botLogin: user.login };
           }
           repositoryNamesForAccount(input.repositories, selectedConnection.accountLogin);
           const token = await appAuth.mintInstallationAccessToken({
@@ -336,18 +348,19 @@ function createPersonalGitHub(
       ? readPersonalGitHubEnvironment(process.env)
       : (options.personal ?? undefined);
   if (environment === undefined) return { personal: undefined, email: undefined };
-  const personal = createPersonalGitHubAccount(environment.token, options.fetch);
+  const account = createPersonalGitHubAccount(environment.token, options.fetch);
+  const personal = { account, installationId: environment.installationId };
   const email =
-    environment.imapUrl === undefined || environment.installationId === undefined
+    environment.imapUrl === undefined
       ? undefined
       : createEmailSource({
           imapUrl: environment.imapUrl,
           installationId: environment.installationId,
-          octokit: personal.octokit,
+          octokit: account.octokit,
           appInstalled: (repositoryId) =>
             appInstalled(
               database,
-              environment.installationId!,
+              environment.installationId,
               (candidate) => candidate.repositoryId === repositoryId,
             ),
           accept: (input) =>

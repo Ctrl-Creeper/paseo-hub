@@ -10,11 +10,11 @@ the App keeps handling installation, webhooks, and configuration sync.
 
 ## Configure the Hub
 
-| Variable                        | Purpose                                                                                                                                                                                                                                                                                |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GITHUB_PERSONAL_TOKEN`         | A classic personal access token with the `repo` scope. Fine-grained tokens cannot write to repositories owned by someone else. Give it an expiry.                                                                                                                                      |
-| `GITHUB_NOTIFY_IMAP_URL`        | Optional. `imaps://<user>:<password>@<host>:993` for the mailbox that receives your GitHub notification emails. Percent-encode `@` in the user as `%40`. Only `imaps://` is accepted.                                                                                                  |
-| `GITHUB_NOTIFY_INSTALLATION_ID` | Required with `GITHUB_NOTIFY_IMAP_URL`. The App installation whose connection receives emailed events for routing; find it at github.com/settings/installations → Configure, as the number at the end of the URL. Emailed events reach the projects of that connection's organization. |
+| Variable                          | Purpose                                                                                                                                                                                                                                                                                                                      |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITHUB_PERSONAL_TOKEN`           | A classic personal access token with the `repo` scope. Fine-grained tokens cannot write to repositories owned by someone else. Give it an expiry.                                                                                                                                                                            |
+| `GITHUB_PERSONAL_INSTALLATION_ID` | Required with the token. The one App installation whose connection may use your account; find it at github.com/settings/installations → Configure, as the number at the end of the URL. Only that connection's projects can ask for the account, Hub replies as you only on its events, and emailed events are routed to it. |
+| `GITHUB_NOTIFY_IMAP_URL`          | Optional. `imaps://<user>:<password>@<host>:993` for the mailbox that receives your GitHub notification emails. Percent-encode `@` in the user as `%40`. Only `imaps://` is accepted.                                                                                                                                        |
 
 Set them as secrets, never in configuration files. Without `GITHUB_PERSONAL_TOKEN`, Hub behaves
 exactly as before and steps asking for the account fail with a clear error.
@@ -61,7 +61,7 @@ Hub can read over IMAP:
 2. Forward `from:notifications@github.com` to the Hub mailbox. In Gmail, add the mailbox under
    Settings → Forwarding and POP/IMAP, confirm it, then create a filter that forwards matching
    mail. Leave forwarding of all mail off.
-3. Set `GITHUB_NOTIFY_IMAP_URL` and `GITHUB_NOTIFY_INSTALLATION_ID`.
+3. Set `GITHUB_NOTIFY_IMAP_URL`.
 
 Hub idles on the inbox and handles new mail within seconds. Each email is only a pointer:
 
@@ -89,7 +89,8 @@ not start runs; other people's do.
 ## What this costs
 
 - Every `identity: account` step can do anything your account can. Anyone who can merge workflow
-  configuration into a connected project can write such a step.
+  configuration into a project of the `GITHUB_PERSONAL_INSTALLATION_ID` connection can write such
+  a step; other organizations on the Hub are refused.
 - While a run is active, its token is stored unencrypted in the Hub database with its other
   credentials. A personal token lives far longer than an installation token, so protect database
   backups and set an expiry on the token.

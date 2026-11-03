@@ -22,8 +22,12 @@ export interface PersonalGitHubEnvironment {
   token: string;
   /** imaps://user:pass@host:993 — the mailbox Gmail forwards GitHub notifications into. */
   imapUrl?: string;
-  /** The App installation whose connection receives emailed events for routing. */
-  installationId?: number;
+  /**
+   * The only App installation whose connection may use the account: its projects can ask for
+   * `identity: account` or `account_token`, Hub replies as the account on its events, and emailed
+   * events are routed to it. Any other organization on the Hub never sees the token.
+   */
+  installationId: number;
 }
 
 const userSchema = z.object({ id: z.number().int().positive(), login: z.string().min(1) });
@@ -34,21 +38,14 @@ export function readPersonalGitHubEnvironment(
 ): PersonalGitHubEnvironment | undefined {
   const token = environment["GITHUB_PERSONAL_TOKEN"]?.trim();
   if (!token) return undefined;
-  const imapUrl = environment["GITHUB_NOTIFY_IMAP_URL"]?.trim();
-  if (!imapUrl) return { token };
-  return {
-    token,
-    imapUrl,
-    installationId: positiveInteger(environment, "GITHUB_NOTIFY_INSTALLATION_ID"),
-  };
-}
-
-function positiveInteger(environment: NodeJS.ProcessEnv, name: string): number {
-  const value = Number(environment[name]?.trim());
-  if (!(Number.isSafeInteger(value) && value > 0)) {
-    throw new Error(`${name} must be a positive integer when GITHUB_NOTIFY_IMAP_URL is set`);
+  const installationId = Number(environment["GITHUB_PERSONAL_INSTALLATION_ID"]?.trim());
+  if (!(Number.isSafeInteger(installationId) && installationId > 0)) {
+    throw new Error(
+      "GITHUB_PERSONAL_INSTALLATION_ID must name the App installation allowed to use GITHUB_PERSONAL_TOKEN",
+    );
   }
-  return value;
+  const imapUrl = environment["GITHUB_NOTIFY_IMAP_URL"]?.trim();
+  return { token, installationId, ...(imapUrl ? { imapUrl } : {}) };
 }
 
 export function createPersonalGitHubAccount(
