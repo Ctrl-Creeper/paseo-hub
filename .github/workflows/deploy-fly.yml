@@ -25,7 +25,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HUB_SHA: ${{ github.event.workflow_run.head_sha }}
+          HAS_FLY_TOKEN: ${{ secrets.FLY_API_TOKEN != '' }}
         run: |
+          # Forks start without FLY_API_TOKEN; skip instead of failing until one is configured.
+          if [[ "$HAS_FLY_TOKEN" != "true" ]]; then
+            echo "::notice::FLY_API_TOKEN is not set; skipping the Fly deploy"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           current_main="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
           if [[ "$HUB_SHA" != "$current_main" ]]; then
             echo "Skipping superseded commit $HUB_SHA; current main is $current_main"
