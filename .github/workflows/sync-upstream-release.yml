@@ -52,6 +52,23 @@ jobs:
             echo "conflict=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Releases v<upstream>-N once per new main commit: -1 for the merge, -2 onward for fork commits on top.
+      # Created with GITHUB_TOKEN, so the tag does not trigger release.yml (which rejects suffixed tags).
+      - name: Release fork
+        if: steps.merge.outputs.conflict != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.merge.outputs.tag }}
+        run: |
+          if [ -n "$(git tag --points-at HEAD -l "$TAG-*")" ]; then
+            echo "HEAD is already released."
+            exit 0
+          fi
+          last="$(git tag -l "$TAG-*" | sed "s/^$TAG-//" | grep -E '^[0-9]+$' | sort -n | tail -1)"
+          release="$TAG-$(( ${last:-0} + 1 ))"
+          gh release view "$TAG" -R "$UPSTREAM" --json body --jq .body > "$RUNNER_TEMP/notes.md"
+          gh release create "$release" --target "$(git rev-parse HEAD)" --title "Paseo Hub $release" --notes-file "$RUNNER_TEMP/notes.md" --latest
+
       - name: Open conflict issue
         if: steps.merge.outputs.conflict == 'true'
         env:
