@@ -1,6 +1,7 @@
 import { parseTriggerDocument } from "../triggers/configuration/index.js";
 import { dump, load } from "js-yaml";
 import { z } from "zod";
+import { readPersonalGitHubEnvironment } from "../providers/github/personal.js";
 import {
   compiledConfigurationHash,
   parseCompiledHubConfig,
@@ -683,6 +684,21 @@ async function compileTriggers(
         authored,
         new Set(candidates.map((connection) => connection.id)),
       );
+      const emailed =
+        resolved === undefined && provider === "github"
+          ? emailedConnection(usage.github, candidates)
+          : undefined;
+      if (emailed !== undefined) {
+        // Matched by name in the GitHub matcher; the repository has no App ID to key a route on.
+        compiled.push({ ...trigger, filters: { ...filter, connectionId: emailed } });
+        routes.push({
+          provider,
+          connectionId: emailed,
+          resourceId: null,
+          triggerName: trigger.name,
+        });
+        continue;
+      }
       if (resolved === undefined) {
         issues.push({
           path: triggerFilterPath(trigger, resourceField(provider)),
@@ -729,6 +745,28 @@ async function compileTriggers(
     }
   }
   return { triggers: compiled, routes, issues };
+}
+
+/**
+ * The connection notification emails arrive on, when it is one the trigger may use. A repository
+ * the App is not installed on reaches Hub only that way, so naming one is valid only there.
+ */
+function emailedConnection(
+  github: Awaited<ReturnType<Database["organizationConnectionUsage"]>>["github"],
+  candidates: readonly { id: string }[],
+): string | undefined {
+  let personal;
+  try {
+    personal = readPersonalGitHubEnvironment(process.env);
+  } catch {
+    return undefined;
+  }
+  if (personal?.imapUrl === undefined) return undefined;
+  const allowed = new Set(candidates.map(({ id }) => id));
+  return github.find(
+    (connection) =>
+      connection.installationId === personal.installationId && allowed.has(connection.id),
+  )?.id;
 }
 
 function providerForEvent(eventName: string): ConnectionProvider | undefined {

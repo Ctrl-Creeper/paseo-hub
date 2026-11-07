@@ -497,6 +497,82 @@ describe("ProjectConfigurationStore resource compilation", () => {
   });
 });
 
+describe("GitHub repositories reached only by notification email", () => {
+  const github = {
+    id: "00000000-0000-4000-8000-000000000004",
+    organizationId: "org_1",
+    slug: "acme-github",
+    installationId: 77,
+    accountId: "1",
+    accountLogin: "acme",
+    accountType: "Organization",
+    status: "active" as const,
+    providerApplicationId: null,
+  };
+  const configuration = {
+    environments: [{ name: "runner", kind: "daemon", daemon: TEST_DAEMON_SLUG, cwd: "/repo" }],
+    triggers: [
+      {
+        name: "upstream-pr",
+        on: "github.pull_request_synchronized",
+        max_runtime: "1h",
+        filters: { connection: "acme-github", repo: "other/upstream", from_users: ["*"] },
+        steps: [
+          {
+            id: "run",
+            environment: "runner",
+            max_runtime: "30m",
+            idle_timeout: "5m",
+            agent: { provider: "test", mode: "default" },
+            prompt: [{ text: "Handle it" }],
+          },
+        ],
+      },
+    ],
+  };
+
+  async function save(environment: Record<string, string>) {
+    const saved = { ...process.env };
+    Object.assign(process.env, environment);
+    try {
+      const database = createMemoryDatabase();
+      await enrollTestDaemon(database);
+      database.organizationConnectionUsage = () =>
+        Promise.resolve({ github: [github], slack: [], discord: [], linear: [] });
+      const project = await database.createProject({
+        organizationId: "org_1",
+        name: "Emailed repository project",
+        slug: "emailed-repository-project",
+        createdByUserId: "user-1",
+      });
+      const store = new ProjectConfigurationStore(database, project.id);
+      return await store.insertManualBundleRevision({
+        files: configurationBundleFixture(dump(configuration)),
+        userId: "user-1",
+      });
+    } finally {
+      process.env = saved;
+    }
+  }
+
+  it("routes a repository the App lacks through the emailed installation, matched by name", async () => {
+    const revision = await save({
+      GITHUB_PERSONAL_TOKEN: "ghp_test",
+      GITHUB_PERSONAL_INSTALLATION_ID: "77",
+      GITHUB_NOTIFY_IMAP_URL: "imaps://user:pass@mail.example:993",
+    });
+    assert.equal(revision.validationErrors, null);
+  });
+
+  it("still refuses an unknown repository when no mailbox delivers it", async () => {
+    const revision = await save({ GITHUB_PERSONAL_TOKEN: "", GITHUB_NOTIFY_IMAP_URL: "" });
+    assert.match(
+      JSON.stringify(revision.validationErrors),
+      /\\"other\/upstream\\" does not match any GitHub repository/u,
+    );
+  });
+});
+
 function discordConfiguration(filters: Record<string, string>) {
   return {
     environments: [{ name: "runner", kind: "daemon", daemon: TEST_DAEMON_SLUG, cwd: "/repo" }],
