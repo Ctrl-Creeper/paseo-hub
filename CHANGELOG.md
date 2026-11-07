@@ -10,6 +10,7 @@
 
 - `github.pull_request_synchronized` triggers a workflow when new commits are pushed to a pull request, with the pushed head SHA in the agent context.
 - The GitHub `exclude_contains` filter skips an event whose text contains the given string, so a general mention trigger can leave a command such as `@bot review` to the trigger that owns it.
+- The trigger form edits each event's filters — GitHub repository, text, and labels; Slack and Discord workspace, server, channels, and command; Linear project, states, assignees, and labels — and the run's worktree, workspace title, startup timeout, archiving, and background workspace. The trigger list shows the repository a GitHub trigger is limited to.
 - `github.pull_request_ready_for_review` triggers a workflow when a draft pull request is marked ready for review, without running on creation or later pushes. GitHub pull request deliveries expose the draft status and head SHA in the agent context for revision checks.
 
 ### Changed

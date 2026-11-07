@@ -163,7 +163,9 @@ export const TriggerDocumentSchema = z
       if (!isEditorEvent(event)) continue;
       for (const qualifier of eventDefinition(event).qualifiers) {
         const value = definition.filters?.[qualifier.key];
-        if (qualifier.required && (value === undefined || value.trim().length === 0)) {
+        const blank =
+          value === undefined || (typeof value === "string" ? value.trim() : value).length === 0;
+        if (qualifier.required && blank) {
           context.addIssue({
             code: z.ZodIssueCode.custom,
             path: ["on", event, "filters", qualifier.key],

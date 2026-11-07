@@ -161,6 +161,14 @@ describe("trigger form YAML bridge", () => {
       qualifiers: {},
       daemon: "office",
       cwd: "/workspace",
+      worktreeMode: "",
+      worktreeBranch: "",
+      worktreeBase: "",
+      worktreePr: "",
+      title: "",
+      startupTimeout: "",
+      autoArchive: true,
+      background: false,
       agent: "codex/gpt-5.4",
       mode: "full-access",
       thinkingOptionId: "",
@@ -201,6 +209,14 @@ describe("trigger form YAML bridge", () => {
       qualifiers: {},
       daemon: "office",
       cwd: "/workspace",
+      worktreeMode: "",
+      worktreeBranch: "",
+      worktreeBase: "",
+      worktreePr: "",
+      title: "",
+      startupTimeout: "",
+      autoArchive: true,
+      background: false,
       agent: "opencode",
       mode: "full-access",
       thinkingOptionId: "",
@@ -361,7 +377,18 @@ test.each([
   "linear.comment_created",
   "linear.issue_entered_scope",
 ])("edits supported event %s", (event) => {
-  expect(projectTriggerForm(ADVANCED.replace("slack.mention", event)).status).toBe("editable");
+  // The compiler refuses an entered-scope trigger without a project, so the form does too.
+  const yaml = ADVANCED.replace("slack.mention", event).replace(
+    "channels: [engineering]",
+    event === "linear.issue_entered_scope" ? "project: platform" : "channels: [engineering]",
+  );
+  expect(projectTriggerForm(yaml).status).toBe("editable");
+});
+
+test("refuses an entered-scope trigger without its project", () => {
+  expect(
+    projectTriggerForm(ADVANCED.replace("slack.mention", "linear.issue_entered_scope")).status,
+  ).toBe("yaml_only");
 });
 
 test("round trips the added label separately from existing item labels", () => {
@@ -373,7 +400,10 @@ test("round trips the added label separately from existing item labels", () => {
   expect(projection.status).toBe("editable");
   if (projection.status !== "editable") throw new Error("not editable");
   expect(projection.value.qualifiers.label).toBe("ready");
-  const patched = patchTriggerYaml(yaml, { ...projection.value, qualifiers: { label: "review" } });
+  const patched = patchTriggerYaml(yaml, {
+    ...projection.value,
+    qualifiers: { ...projection.value.qualifiers, label: "review" },
+  });
   expect(
     TriggerDocumentSchema.parse(parseDocument(patched).toJS()).on["github.pull_request_label_added"]
       ?.filters,
@@ -500,4 +530,94 @@ test("a trigger row names the event kind before what narrows it", () => {
     kind: "Manual run",
   });
   expect(describeTriggerEvent(null, "github.push")).toEqual({ kind: "GitHub push" });
+});
+
+describe("filters and workspace in the form", () => {
+  const SCOPED = `name: fork
+enabled: true
+on:
+  github.issue_created:
+    connection: company-github
+    filters:
+      repo: acme/api
+      from_users: [alice]
+      labels: [bug, triage]
+run:
+  target:
+    daemon: office
+    cwd: /workspace
+    worktree:
+      mode: branch-off
+      newBranch: hub-\${{ paseo.execution.id }}
+      base: origin/main
+  agent:
+    provider: codex
+    mode: auto
+  title: Fix
+  startup_timeout: 3m
+  prompt: Handle it.
+  auto_archive: false
+  background: true
+`;
+
+  test("reads repository, list filters, and workspace settings", () => {
+    const projection = projectTriggerForm(SCOPED);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    expect(projection.value).toMatchObject({
+      qualifiers: { repo: "acme/api", labels: "bug, triage" },
+      worktreeMode: "branch-off",
+      worktreeBranch: "hub-${{ paseo.execution.id }}",
+      worktreeBase: "origin/main",
+      title: "Fix",
+      startupTimeout: "3m",
+      autoArchive: false,
+      background: true,
+    });
+    expect(patchTriggerYaml(SCOPED, projection.value)).toBe(SCOPED);
+  });
+
+  test("writes edited filters as the schema's shapes and drops blanks", () => {
+    const projection = projectTriggerForm(SCOPED);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const yaml = patchTriggerYaml(SCOPED, {
+      ...projection.value,
+      qualifiers: { repo: " ", labels: "bug,  needs-fix ,", contains: "/fix" },
+      worktreeMode: "checkout-pr",
+      worktreePr: "42",
+      autoArchive: true,
+      background: false,
+    });
+    const document = TriggerDocumentSchema.parse(parseDocument(yaml).toJS());
+    expect(document.on["github.issue_created"]!.filters).toEqual({
+      from_users: ["alice"],
+      labels: ["bug", "needs-fix"],
+      contains: "/fix",
+    });
+    expect(document.run.target.worktree).toEqual({ mode: "checkout-pr", prNumber: 42 });
+    expect(yaml).not.toContain("auto_archive");
+    expect(yaml).not.toContain("background");
+  });
+
+  test("asks for the branch a worktree needs", () => {
+    const projection = projectTriggerForm(SCOPED);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    expect(
+      triggerFormErrors({
+        ...projection.value,
+        worktreeMode: "checkout-branch",
+        worktreeBranch: "",
+      }),
+    ).toEqual({ worktreeBranch: "Branch is required." });
+    expect(
+      triggerFormErrors({ ...projection.value, worktreeMode: "checkout-pr", worktreePr: "x" }),
+    ).toEqual({ worktreePr: "Enter a pull request number." });
+  });
+
+  test("shows the repository a GitHub trigger is scoped to in the list", () => {
+    const projection = projectTriggerForm(SCOPED);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    expect(describeTriggerEvent(projection.value, "github.issue_created").detail).toBe(
+      "company-github · acme/api",
+    );
+  });
 });

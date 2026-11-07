@@ -27,6 +27,16 @@ export interface TriggerFormValue {
   recurrence?: Recurrence;
   daemon: string;
   cwd: string;
+  /** "" for the checkout itself, otherwise a `run.target.worktree.mode`. */
+  worktreeMode: string;
+  /** The new branch for branch-off, the existing branch for checkout-branch. */
+  worktreeBranch: string;
+  worktreeBase: string;
+  worktreePr: string;
+  title: string;
+  startupTimeout: string;
+  autoArchive: boolean;
+  background: boolean;
   agent: string;
   mode: string;
   thinkingOptionId: string;
@@ -89,6 +99,7 @@ function toFormValue(
     recurrence: definition.recurrence ?? DEFAULT_RECURRENCE,
     daemon: trigger.run.target.daemon,
     cwd: trigger.run.target.cwd,
+    ...workspaceFormValue(trigger.run),
     agent: joinAgentId(agent.provider, agent.model),
     mode: agent.mode ?? "",
     thinkingOptionId: agent.thinkingOptionId ?? "",
@@ -153,6 +164,12 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
 
   setIfChanged(document, ["run", "target", "daemon"], value.daemon);
   setIfChanged(document, ["run", "target", "cwd"], value.cwd);
+  setOptional(document, ["run", "target", "worktree"], formWorktree(value));
+  setOptional(document, ["run", "title"], blankToUndefined(value.title));
+  setOptional(document, ["run", "startup_timeout"], blankToUndefined(value.startupTimeout));
+  // Defaults stay unwritten, so a form save never adds lines the author did not choose.
+  setOptional(document, ["run", "auto_archive"], value.autoArchive ? undefined : false);
+  setOptional(document, ["run", "background"], value.background ? true : undefined);
   const agent = splitAgentId(value.agent);
   setIfChanged(document, ["run", "agent", "provider"], agent.provider);
   setOptional(document, ["run", "agent", "model"], agent.model);
@@ -210,13 +227,20 @@ export function createTriggerYaml(value: TriggerFormValue): string {
   const providerOptions = parseProviderOptions(value.providerOptions);
   const github = githubAuthority(value);
   const definition = formEventDefinition(value);
+  const worktree = formWorktree(value);
+  const title = blankToUndefined(value.title);
+  const startupTimeout = blankToUndefined(value.startupTimeout);
   return stringify(
     {
       name: value.name,
       enabled: value.enabled,
       on: { [value.event]: definition },
       run: {
-        target: { daemon: value.daemon, cwd: value.cwd },
+        target: {
+          daemon: value.daemon,
+          cwd: value.cwd,
+          ...(worktree === undefined ? {} : { worktree }),
+        },
         agent: {
           provider: agent.provider,
           ...(agent.model === undefined ? {} : { model: agent.model }),
@@ -229,8 +253,12 @@ export function createTriggerYaml(value: TriggerFormValue): string {
         continuation: formContinuation(value),
         max_runtime: value.maxRuntime.trim(),
         idle_timeout: value.idleTimeout.trim(),
+        ...(startupTimeout === undefined ? {} : { startup_timeout: startupTimeout }),
+        ...(title === undefined ? {} : { title }),
         ...(github === undefined ? {} : { github }),
         prompt: value.prompt,
+        ...(value.autoArchive ? {} : { auto_archive: false }),
+        ...(value.background ? { background: true } : {}),
       },
     },
     { lineWidth: 0, compat: ["timestamp"] },
@@ -245,6 +273,60 @@ function formEventDefinition(value: TriggerFormValue): TriggerDocument["on"][str
     connection: value.connection,
     filters: { from_users: users(value.allowedUsers), ...authoredQualifiers(value) },
   };
+}
+
+type WorktreeTarget = NonNullable<TriggerDocument["run"]["target"]["worktree"]>;
+
+function worktreeFormValue(worktree: WorktreeTarget | undefined) {
+  const value = { worktreeMode: "", worktreeBranch: "", worktreeBase: "", worktreePr: "" };
+  if (worktree === undefined) return value;
+  value.worktreeMode = worktree.mode;
+  if (worktree.mode === "branch-off") {
+    value.worktreeBranch = worktree.newBranch;
+    value.worktreeBase = worktree.base ?? "";
+  } else if (worktree.mode === "checkout-branch") {
+    value.worktreeBranch = worktree.branch;
+  } else {
+    value.worktreePr = String(worktree.prNumber);
+  }
+  return value;
+}
+
+/** The run-level workspace settings, read where the form keeps them. */
+function workspaceFormValue(run: TriggerDocument["run"]) {
+  return {
+    ...worktreeFormValue(run.target.worktree),
+    title: run.title ?? "",
+    startupTimeout: run.startup_timeout ?? "",
+    autoArchive: run.auto_archive,
+    background: run.background,
+  };
+}
+
+function formWorktree(value: TriggerFormValue): WorktreeTarget | undefined {
+  const branch = value.worktreeBranch.trim();
+  if (value.worktreeMode === "branch-off") {
+    const base = blankToUndefined(value.worktreeBase);
+    return { mode: "branch-off", newBranch: branch, ...(base === undefined ? {} : { base }) };
+  }
+  if (value.worktreeMode === "checkout-branch") return { mode: "checkout-branch", branch };
+  if (value.worktreeMode === "checkout-pr") {
+    return { mode: "checkout-pr", prNumber: Number(value.worktreePr.trim()) };
+  }
+  return undefined;
+}
+
+function worktreeErrors(value: TriggerFormValue): TriggerFieldErrors {
+  if (
+    (value.worktreeMode === "branch-off" || value.worktreeMode === "checkout-branch") &&
+    value.worktreeBranch.trim().length === 0
+  ) {
+    return { worktreeBranch: "Branch is required." };
+  }
+  if (value.worktreeMode === "checkout-pr" && !/^[1-9][0-9]*$/u.test(value.worktreePr.trim())) {
+    return { worktreePr: "Enter a pull request number." };
+  }
+  return {};
 }
 
 function workingDirectoryErrors(value: TriggerFormValue): TriggerFieldErrors {
@@ -329,6 +411,7 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   Object.assign(errors, recurrenceErrors(value));
   if (value.daemon.trim().length === 0) errors.daemon = "Daemon is required.";
   Object.assign(errors, workingDirectoryErrors(value));
+  Object.assign(errors, worktreeErrors(value));
   if (value.maxRuntime.trim().length === 0) errors.maxRuntime = "Maximum runtime is required.";
   if (value.idleTimeout.trim().length === 0) errors.idleTimeout = "Idle timeout is required.";
   const agent = refused(() => splitAgentId(value.agent));
@@ -472,18 +555,28 @@ function readQualifiers(
   const values: QualifierValues = {};
   for (const qualifier of eventDefinition(event).qualifiers) {
     const value = filters?.[qualifier.key];
-    if (value !== undefined) values[qualifier.key] = value;
+    if (value !== undefined)
+      values[qualifier.key] = Array.isArray(value) ? value.join(", ") : value;
   }
   return values;
 }
 
-function authoredQualifiers(value: TriggerFormValue): QualifierValues {
-  const filters: QualifierValues = {};
+type AuthoredFilters = NonNullable<TriggerDocument["on"][string]["filters"]>;
+
+/** Blank qualifiers are left out: an empty filter would match nothing, not everything. */
+function authoredQualifiers(value: TriggerFormValue): AuthoredFilters {
+  const filters: Record<string, string | string[]> = {};
   for (const qualifier of eventDefinition(value.event).qualifiers) {
-    const selection = value.qualifiers[qualifier.key];
-    if (selection !== undefined) filters[qualifier.key] = selection.trim();
+    const selection = value.qualifiers[qualifier.key] ?? "";
+    if (qualifier.kind === "list") {
+      const entries = commaSeparated(selection);
+      if (entries.length > 0) filters[qualifier.key] = entries;
+    } else if (selection.trim().length > 0) {
+      filters[qualifier.key] = selection.trim();
+    }
   }
-  return filters;
+  // ponytail: each key's kind comes from the event catalog, which mirrors TriggerFilterSchema.
+  return filters as AuthoredFilters;
 }
 
 function formContinuation(value: TriggerFormValue) {
@@ -514,5 +607,6 @@ export function describeTriggerEvent(
     return { kind, detail: recurrenceSummary(value.recurrence ?? DEFAULT_RECURRENCE) };
   }
   if (value === null || value.connection === "") return { kind };
-  return { kind, detail: value.connection };
+  const scope = value.qualifiers.repo?.trim();
+  return { kind, detail: scope ? `${value.connection} · ${scope}` : value.connection };
 }

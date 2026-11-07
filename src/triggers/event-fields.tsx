@@ -24,23 +24,25 @@ export function EventFields({
         error={errors.recurrence}
         onChange={(recurrence) => onChange({ ...value, recurrence })}
       />
-      {eventDefinition(value.event).qualifiers.map((qualifier) => {
-        const error = errors[`qualifiers.${qualifier.key}`];
-        return (
-          <FormField
-            key={qualifier.key}
-            id={`trigger-qualifier-${qualifier.key}`}
-            name={qualifier.key}
-            label={qualifier.label}
-            description={qualifier.description}
-            kind="text"
-            value={value.qualifiers[qualifier.key] ?? ""}
-            onChange={(next) => updateQualifier(qualifier.key, next)}
-            required={qualifier.required}
-            {...(error === undefined ? {} : { error })}
-          />
-        );
-      })}
+      <div className="grid gap-4 sm:grid-cols-2">
+        {eventDefinition(value.event).qualifiers.map((qualifier) => {
+          const error = errors[`qualifiers.${qualifier.key}`];
+          return (
+            <FormField
+              key={qualifier.key}
+              id={`trigger-qualifier-${qualifier.key}`}
+              name={qualifier.key}
+              label={qualifier.label}
+              description={qualifier.description}
+              kind="text"
+              value={value.qualifiers[qualifier.key] ?? ""}
+              onChange={(next) => updateQualifier(qualifier.key, next)}
+              required={qualifier.required}
+              {...(error === undefined ? {} : { error })}
+            />
+          );
+        })}
+      </div>
     </>
   );
 }
