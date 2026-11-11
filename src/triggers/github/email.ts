@@ -214,6 +214,12 @@ export interface EmailSourceOptions {
 
 const RECONNECT_MIN_MS = 30_000;
 const RECONNECT_MAX_MS = 15 * 60_000;
+/**
+ * IDLE alone missed mail: a connection the server or a NAT dropped silently raised no `close`, so
+ * nothing new was ever announced. A periodic drain both catches what IDLE missed and, by issuing a
+ * command, surfaces a dead socket so it closes and reconnects.
+ */
+const POLL_MS = 2 * 60_000;
 
 /**
  * Whether retrying can't help: the content is gone, never existed, or is forbidden. Rate limits
@@ -335,10 +341,12 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
       logger: false,
     });
     client = imap;
+    let poll: ReturnType<typeof setInterval> | undefined;
     imap.on("error", (error: unknown) =>
       logger.warn({ err: error }, "github notification imap error"),
     );
     imap.on("close", () => {
+      clearInterval(poll);
       // Only the current connection reconnects, so a stop and start can't leave two running.
       if (client !== imap) return;
       client = undefined;
@@ -354,6 +362,7 @@ export function createEmailSource(options: EmailSourceOptions): TriggerSource {
       logger.info({ host: url.hostname }, "listening for github notification emails");
       reconnectDelay = RECONNECT_MIN_MS;
       scheduleDrain(imap);
+      poll = setInterval(() => scheduleDrain(imap), POLL_MS);
     } catch (error) {
       logger.error(
         { err: error, retryInMs: reconnectDelay },

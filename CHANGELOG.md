@@ -14,6 +14,10 @@
 - A GitHub `repo` filter may name a repository the App is not installed on when the trigger's connection is the one notification emails arrive on; such a trigger is matched by repository name. Elsewhere an unknown repository is still refused.
 - `github.pull_request_ready_for_review` triggers a workflow when a draft pull request is marked ready for review, without running on creation or later pushes. GitHub pull request deliveries expose the draft status and head SHA in the agent context for revision checks.
 
+### Fixed
+
+- The GitHub notification email source checks the mailbox every two minutes as well as listening for new mail, so a mail connection that dropped silently no longer leaves emails unread until Hub restarts.
+
 ### Changed
 
 - Unhandled provider event receipts expire automatically after seven days on every instance. Receipts routed to a trigger or still referenced by a run or attachment remain available.
