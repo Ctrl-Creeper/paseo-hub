@@ -1,7 +1,9 @@
+import { parseCompiledHubConfig } from "../config/compiler.js";
 import type {
   Database,
   OrganizationTriggerRecord,
   OrganizationTriggerRevisionRecord,
+  SavedOrganizationTrigger,
 } from "../db/types.js";
 import {
   resolveTriggerConfigurationForOrganization,
@@ -16,7 +18,6 @@ import {
   type TriggerDocument,
   type TriggerDocumentIssue,
 } from "./configuration/index.js";
-import { supportsUnattendedRuns, unattendedProviderRefusal } from "./configuration/unattended.js";
 
 export interface SaveTriggerInput {
   triggerId?: string;
@@ -27,6 +28,21 @@ export interface SaveTriggerInput {
 }
 
 type AuthoredAgent = Extract<TriggerDocument["run"]["agent"], { provider: string }>;
+
+/** Legacy records retain their source YAML even when they have no compiled run. */
+export function configuredTriggerEvents(
+  format: OrganizationTriggerRecord["format"],
+  revision: OrganizationTriggerRevisionRecord | undefined,
+): readonly string[] {
+  if (revision === undefined) return [];
+  if (format === "legacy_multistep") {
+    const inline = /^on:\s+([a-z]+(?:\.[a-z_]+)+)\s*$/mu.exec(revision.yaml)?.[1];
+    const nested = /^on:\s*$[\s\S]*?^\s{2}([a-z]+(?:\.[a-z_]+)+):\s*$/mu.exec(revision.yaml)?.[1];
+    const event = inline ?? nested;
+    return event === undefined ? [] : [event];
+  }
+  return parseCompiledHubConfig(revision.normalizedConfiguration).triggers.map(({ on }) => on);
+}
 
 export class OrganizationTriggerStore {
   constructor(
@@ -58,7 +74,7 @@ export class OrganizationTriggerStore {
     return revision;
   }
 
-  async save(input: SaveTriggerInput): Promise<OrganizationTriggerRecord> {
+  async save(input: SaveTriggerInput): Promise<SavedOrganizationTrigger> {
     const previousYaml = await this.activeYaml(input.triggerId);
     const prepared = await this.validate(
       input.yaml,
@@ -126,18 +142,14 @@ export class OrganizationTriggerStore {
     if (target === undefined) throw new Error("compiled trigger target is missing");
     const issues: TriggerDocumentIssue[] = [];
     for (const { path, agent } of authoredAgents(compiled.authored)) {
-      if (!supportsUnattendedRuns(agent.provider)) {
-        issues.push({
-          path: [...path, "provider"],
-          message: unattendedProviderRefusal(agent.provider),
-        });
-        continue;
-      }
       let verdict: Awaited<
         ReturnType<DaemonAgentConfigurationValidator["validateAgentConfiguration"]>
       >;
       try {
-        verdict = await this.agentValidator.validateAgentConfiguration(target.daemonId, agent);
+        verdict = await this.agentValidator.validateAgentConfiguration(
+          { daemonId: target.daemonId, cwd: target.cwd },
+          agent,
+        );
       } catch (error) {
         throw new TriggerDocumentError([
           {
@@ -207,11 +219,6 @@ function validateAuthoringContract(trigger: TriggerDocument): void {
   const issues: Array<{ path: readonly (string | number)[]; message: string }> = [];
   if (!trigger.run.target.cwd.startsWith("/")) {
     issues.push({ path: ["run", "target", "cwd"], message: "must be an absolute path" });
-  }
-  for (const { path, agent } of authoredAgents(trigger)) {
-    if (agent.mode === undefined) {
-      issues.push({ path: [...path, "mode"], message: "is required for new triggers" });
-    }
   }
   if (issues.length > 0) throw new TriggerDocumentError(issues);
 }

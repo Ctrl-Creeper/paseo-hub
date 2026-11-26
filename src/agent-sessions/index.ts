@@ -1,3 +1,5 @@
+import { executionLinkUrl } from "../agent-executions/link.js";
+import { integrationProviders } from "../integration-tools/grants.js";
 import { parseConnectionTemplate } from "../config/connection-template.js";
 import { createHash } from "node:crypto";
 import type { Database, AgentExecutionRecord } from "../db/types.js";
@@ -15,7 +17,7 @@ import {
   deriveAgentExecutionCompletionToken,
   hashAgentExecutionCompletionToken,
 } from "../agent-executions/completion-token.js";
-import type { AgentSessionRecord } from "./types.js";
+import type { AgentSessionAction, AgentSessionRecord } from "./types.js";
 export type { AgentSessionRecord, AgentSessionAction } from "./types.js";
 
 export class AgentSessionError extends Error {}
@@ -79,8 +81,13 @@ export class AgentSessions {
       const tools = executionToolDefinitions(
         input.intent.outputSchema,
         this.outputs.materialize(input.intent.allowOutputs, input.intent.outputContext),
+        input.intent.tools,
       );
-      const compatibility = fingerprint({ settings: policy?.compatibility, tools });
+      const compatibility = fingerprint({
+        settings: policy?.compatibility,
+        tools,
+        grants: input.intent.tools,
+      });
       let session = await findSession();
       if (session && (await isFinishedCredentialedSession(session))) {
         // Completion may have raced credential preparation. Retry outside the lock.
@@ -136,33 +143,57 @@ export class AgentSessions {
       if (Number.isFinite(deadline))
         await this.database.limitAgentExecutionDeadline(input.executionId, new Date(deadline));
       await this.database.attachExecutionToSession(input.executionId, id);
-      let action: "created" | "continued" | "restored" = "continued";
+      let action: AgentSessionAction = "continued";
       if (session.agentId === null) {
         const agent = await input.connection.create(id, session.creationOptions, startupTimeoutMs);
         session = { ...session, agentId: agent.id, workspaceId: agent.workspaceId };
         await this.database.saveAgentSession(session);
         action = "created";
+        // A retry after a lost daemon response finds this agent; the first recorded action stays.
+        await this.database.attachExecutionToSession(input.executionId, id, action);
       }
       if (session.agentId === null || session.workspaceId === null)
         throw new Error("Session agent is missing");
-      await this.database.attachAgentToExecution(
-        input.executionId,
-        session.daemonId,
-        session.agentId,
+      const { agentId, workspaceId, daemonId } = session;
+      action = await this.attachAgent(
+        input,
+        { sessionId: id, daemonId, agentId, workspaceId },
+        action,
+        startupTimeoutMs,
       );
-      const agent = await input.connection.get(session.agentId);
-      if (!agent.archivedAt && (agent.status === "closed" || agent.status === "error")) {
-        throw new AgentSessionError("agent_interrupted");
-      }
-      if (agent.archivedAt) {
-        await input.connection.restore(session.workspaceId, startupTimeoutMs);
-        action = "restored";
-      }
       await this.database.attachExecutionToSession(input.executionId, id, action);
-      const unsubscribe = await this.deliver(input, session.agentId, startupTimeoutMs);
-      return { agentId: session.agentId, unsubscribe, action };
+      const unsubscribe = await this.deliver(input, agentId, startupTimeoutMs);
+      return { agentId, unsubscribe, action };
     });
     return dispatched ?? this.dispatch(input);
+  }
+
+  /**
+   * Points the execution at the session's agent, restoring the agent when it is archived.
+   * A closed or failed agent interrupts only work it already holds: the agent was created for this
+   * execution, possibly in a dispatch that lost its response, or this execution was already
+   * running on it before a restart. Otherwise that state belongs to an earlier turn, and sending
+   * the message resumes the agent from storage.
+   */
+  private async attachAgent(
+    input: { executionId: string; intent: LaunchMachineIntent; connection: AgentConnection },
+    agent: { sessionId: string; daemonId: string; agentId: string; workspaceId: string },
+    action: "created" | "continued",
+    startupTimeoutMs: number,
+  ): Promise<AgentSessionAction> {
+    const execution = await this.database.findAgentExecutionById(input.executionId);
+    const opened =
+      agent.sessionId === deriveSessionId(input.intent.projectId, `execution:${input.executionId}`);
+    const held = action === "created" || opened || execution?.status === "running";
+    await this.database.attachAgentToExecution(input.executionId, agent.daemonId, agent.agentId);
+    const state = await input.connection.get(agent.agentId);
+    if (state.archivedAt) {
+      await input.connection.restore(agent.workspaceId, startupTimeoutMs);
+      return "restored";
+    }
+    if (held && (state.status === "closed" || state.status === "error"))
+      throw new AgentSessionError("agent_interrupted");
+    return action;
   }
 
   private async deliver(
@@ -182,12 +213,25 @@ export class AgentSessions {
       if (execution.deadlineAt !== null && execution.deadlineAt.getTime() <= this.now()) {
         throw new AgentSessionError("execution_deadline_exceeded");
       }
+      const context: string[] = [];
+      if (input.intent.continuation !== undefined) {
+        context.push(
+          `Hub execution: ${input.executionId}\nUse this executionId for Hub tool calls for this request.`,
+        );
+      }
+      const grants = input.intent.tools;
+      if (integrationProviders.some((provider) => grants?.[provider]?.actions.includes("post"))) {
+        const url = executionLinkUrl(this.publicBaseUrl, execution);
+        if (url !== undefined) {
+          context.push(
+            `Open in Paseo: ${url}\nWhen sharing a link to this session, use this URL. For Slack use <${url}|Open in Paseo>. For Discord use [Open in Paseo](${url}).`,
+          );
+        }
+      }
       await input.connection.send(
         agentId,
         input.executionId,
-        input.intent.continuation === undefined
-          ? input.intent.prompt
-          : `Hub execution: ${input.executionId}\nUse this executionId for Hub tool calls for this request.\n\n${input.intent.prompt}`,
+        [...context, input.intent.prompt].join("\n\n"),
         startupTimeoutMs,
       );
       return unsubscribe;

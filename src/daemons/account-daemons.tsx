@@ -1,8 +1,8 @@
 import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { BookOpen } from "lucide-react";
-import { useCallback, useState, type FormEvent } from "react";
+import { BookOpen, RefreshCw } from "lucide-react";
+import { useCallback, useMemo, useState, type FormEvent } from "react";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { CopyField } from "../components/app/copy-field.js";
 import {
@@ -31,8 +31,9 @@ import {
 } from "./functions.js";
 import type { Result } from "../contract/respond.js";
 import { DAEMON_MUTATION_KEY } from "../auth/tenant-mutation.js";
+import { ActivityLink } from "../activity/link.js";
 import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "./handoff.js";
-import { daemonsQueryKey, refreshDaemons } from "./status.js";
+import { connectedDaemon, daemonsQueryKey, refreshDaemons } from "./status.js";
 
 const DAEMON_COLUMNS: readonly DataColumn[] = [
   { header: "Slug", fill: true },
@@ -43,12 +44,18 @@ const DAEMON_COLUMNS: readonly DataColumn[] = [
   { header: "Registered" },
   { header: "", align: "end" },
 ];
-const DAEMONS_DESCRIPTION = "Stable daemon identities registered to this organization.";
+const DAEMONS_DESCRIPTION = "Stable daemon identities registered to this organization";
 const DAEMON_DOCS_URL = "https://paseo.sh/docs/hub/daemons";
+/**
+ * A list with no connected daemon is waiting on a terminal, not on the reader: `paseo hub login`
+ * finishes in the browser and the daemon enrolls and connects a moment later. Offline and revoked
+ * rows are not a daemon to run on, so the list looks again until one connects.
+ */
+const WAITING_POLL_MS = 3_000;
 const DAEMONS_EMPTY = {
   title: "No daemons connected",
   description:
-    "Hub runs your workflows on machines you own. Log in from the machine where your code lives and the CLI offers to connect it.",
+    "Hub runs your workflows on machines you own. Log in from the machine where your code lives and the CLI offers to connect it",
   action: <ConnectDaemonHint />,
 } as const;
 
@@ -91,6 +98,8 @@ export function DaemonsPanel({
   const snapshot = useSnapshotQuery({
     queryKey,
     queryFn: () => loadDaemons({ data: { organizationSlug } }),
+    refetchInterval: (list) =>
+      list !== undefined && connectedDaemon(list.daemons) === undefined ? WAITING_POLL_MS : false,
   });
   const rename = useMutation({
     mutationKey: DAEMON_MUTATION_KEY,
@@ -131,9 +140,9 @@ export function DaemonsPanel({
         if (result.status === "error") return result.error.message;
         return result.data.state === "complete"
           ? undefined
-          : "The daemon is no longer available in the current organization. Reload the daemon list.";
+          : "The daemon is no longer available in the current organization. Reload the daemon list";
       } catch {
-        return "Hub did not receive the daemon rename result. Check your connection and reload its current name.";
+        return "Hub did not receive the daemon rename result. Check your connection and reload its current name";
       }
     },
     [organizationSlug, rename],
@@ -145,11 +154,16 @@ export function DaemonsPanel({
   if (snapshot.status === "pending") return <DaemonLoading />;
   if (snapshot.status === "error") {
     return (
-      <FailureAlert
-        title="Daemons unavailable"
-        error={snapshot.error}
-        fallback="Hub did not receive the daemon list. Check your connection and reload the page."
-      />
+      <>
+        <DaemonsHeader />
+        <FailureAlert
+          standalone
+          title="Daemons unavailable"
+          error={snapshot.error}
+          fallback="Hub did not receive the daemon list. Check your connection and retry"
+          onRetry={snapshot.refetch}
+        />
+      </>
     );
   }
   const daemons = snapshot.data;
@@ -157,13 +171,13 @@ export function DaemonsPanel({
   const busy = rename.isPending || revoke.isPending;
   return (
     <>
-      <PageHeader id="daemons-heading" title="Daemons" description={DAEMONS_DESCRIPTION} />
+      <DaemonsHeader onRefresh={snapshot.refetch} />
       {revokeFailed ? (
         <FailureAlert
           standalone
           title="The daemon wasn't revoked"
           error={revoke.data}
-          fallback="Hub did not receive the daemon revocation result. Check your connection and reload its current status."
+          fallback="Hub did not receive the daemon revocation result. Check your connection and reload its current status"
         />
       ) : null}
       <DataTable
@@ -176,6 +190,7 @@ export function DaemonsPanel({
           <DaemonRow
             key={daemon.id}
             daemon={daemon}
+            organizationSlug={organizationSlug}
             canManage={daemons.canManage}
             busy={busy}
             onRename={renameSelected}
@@ -189,12 +204,14 @@ export function DaemonsPanel({
 
 function DaemonRow({
   daemon,
+  organizationSlug,
   canManage,
   busy,
   onRename,
   onRevoke,
 }: {
   daemon: BrowserDaemon;
+  organizationSlug: string;
   canManage: boolean;
   busy: boolean;
   onRename: (daemonId: string, slug: string) => Promise<string | undefined>;
@@ -206,6 +223,7 @@ function DaemonRow({
     setRenaming(true);
   }, []);
   const revoke = useCallback(() => onRevoke(daemon.id), [daemon.id, onRevoke]);
+  const activitySearch = useMemo(() => ({ daemon: daemon.id }), [daemon.id]);
 
   return (
     <DataRow>
@@ -232,33 +250,38 @@ function DaemonRow({
         <RelativeTime value={daemon.registeredAt} />
       </DataCell>
       <DataCell>
-        {canManage ? (
-          <>
-            <RowActions label={`Actions for ${daemon.slug}`}>
-              <DropdownMenuItem disabled={busy} onSelect={requestRename}>
-                Rename
-              </DropdownMenuItem>
-              {daemon.status === "revoked" ? null : (
-                <ConfirmMenuItem
-                  busy={busy}
-                  destructive
-                  label="Revoke"
-                  title={`Revoke ${daemon.slug}?`}
-                  description="The daemon will disconnect and its credential cannot reconnect."
-                  cancelLabel="Cancel"
-                  confirmLabel="Revoke daemon"
-                  onConfirm={revoke}
-                />
-              )}
-            </RowActions>
-            <RenameDaemonDialog
-              daemon={daemon}
+        <RowActions label={`Actions for ${daemon.slug}`}>
+          <DropdownMenuItem asChild>
+            <ActivityLink organizationSlug={organizationSlug} search={activitySearch}>
+              View activity
+            </ActivityLink>
+          </DropdownMenuItem>
+          {canManage ? (
+            <DropdownMenuItem disabled={busy} onSelect={requestRename}>
+              Rename
+            </DropdownMenuItem>
+          ) : null}
+          {canManage && daemon.status !== "revoked" ? (
+            <ConfirmMenuItem
               busy={busy}
-              onRename={onRename}
-              open={renaming}
-              onOpenChange={setRenaming}
+              destructive
+              label="Revoke"
+              title={`Revoke ${daemon.slug}?`}
+              description="The daemon will disconnect and its credential cannot reconnect"
+              cancelLabel="Cancel"
+              confirmLabel="Revoke daemon"
+              onConfirm={revoke}
             />
-          </>
+          ) : null}
+        </RowActions>
+        {canManage ? (
+          <RenameDaemonDialog
+            daemon={daemon}
+            busy={busy}
+            onRename={onRename}
+            open={renaming}
+            onOpenChange={setRenaming}
+          />
         ) : null}
       </DataCell>
     </DataRow>
@@ -334,10 +357,29 @@ function DaemonStatus({ daemon }: { daemon: BrowserDaemon }) {
   return <StatusPill tone="neutral">Offline</StatusPill>;
 }
 
+/**
+ * The page's one heading in every state, so a failed read or a load never moves it. Refresh is
+ * for the reader who knows a daemon just changed; an empty list already looks again on its own.
+ * It comes with the list: before one there is nothing to refresh, and a failed read already has
+ * its own Try again in the alert.
+ */
+function DaemonsHeader({ onRefresh }: { onRefresh?: () => void }) {
+  return (
+    <PageHeader id="daemons-heading" title="Daemons" description={DAEMONS_DESCRIPTION}>
+      {onRefresh === undefined ? null : (
+        <Button type="button" variant="outline" size="sm" onClick={onRefresh}>
+          <RefreshCw aria-hidden="true" />
+          Refresh
+        </Button>
+      )}
+    </PageHeader>
+  );
+}
+
 function DaemonLoading() {
   return (
     <>
-      <PageHeader id="daemons-heading" title="Daemons" description={DAEMONS_DESCRIPTION} />
+      <DaemonsHeader />
       <DataTableSkeleton label="Daemons" columns={DAEMON_COLUMNS} />
     </>
   );

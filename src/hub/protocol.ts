@@ -84,7 +84,11 @@ const HubTimelineItemSchema = z
   .passthrough();
 
 export function isHubFinishExecutionToolName(name: string): boolean {
-  return name === "hub.finish_execution" || name === "mcp__hub__finish_execution";
+  return (
+    name === "hub.finish_execution" ||
+    name === "hub_finish_execution" ||
+    name === "mcp__hub__finish_execution"
+  );
 }
 
 export const HubDaemonHelloSchema = z.object({
@@ -169,6 +173,8 @@ export const HubExecutionAgentStreamEventSchema = z.discriminatedUnion("type", [
 export const HubExecutionAgentValidateRequestSchema = z.object({
   type: z.literal("hub.execution.agent.validate.request"),
   requestId: z.string(),
+  /** The directory the agent will run in; the daemon validates against that directory's catalog. */
+  cwd: z.string().optional(),
   provider: z.string(),
   model: z.string().optional(),
   modeId: z.string().optional(),
@@ -222,6 +228,27 @@ export const RefreshProvidersSnapshotResponseSchema = z.object({
   }),
 });
 
+export const ProjectListRequestSchema = z.object({
+  type: z.literal("project.list.request"),
+  requestId: z.string(),
+});
+
+/** The fields Hub reads from a daemon project; the daemon sends more, and may add to them. */
+export const ProjectListResponseSchema = z.object({
+  type: z.literal("project.list.response"),
+  payload: z.object({
+    requestId: z.string(),
+    projects: z.array(
+      z.object({
+        projectId: z.string(),
+        projectDisplayName: z.string(),
+        projectCustomName: z.string().nullable().optional(),
+        projectRootPath: z.string(),
+      }),
+    ),
+  }),
+});
+
 export const HubExecutionControlActionSchema = z.enum(["interrupt", "archive"]);
 
 const RpcErrorSchema = z.object({
@@ -240,6 +267,7 @@ export const HubExecutionOutboundSchema = z.object({
     HubExecutionAgentValidateResponseSchema,
     GetProvidersSnapshotResponseSchema,
     RefreshProvidersSnapshotResponseSchema,
+    ProjectListResponseSchema,
     RpcErrorSchema,
   ]),
 });

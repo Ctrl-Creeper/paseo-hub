@@ -1,7 +1,18 @@
 import { eventDefinition, isEditorEvent } from "../triggers/configuration/events.js";
 import { ContinuationSchema } from "../triggers/continuation.js";
+import {
+  GitHubAuthorAssociationSchema,
+  reportsAuthorAssociation,
+  type GitHubAuthorAssociation,
+} from "../triggers/github/author-association.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import {
+  CompiledIntegrationToolGrantsSchema,
+  IntegrationToolGrantsSchema,
+  normalizeIntegrationToolGrants,
+  type IntegrationToolGrants,
+} from "../integration-tools/grants.js";
 import {
   expressionPaths,
   parseExpression,
@@ -104,6 +115,8 @@ const AuthoredTriggerFilterSchema = z
     assignees: z.array(z.string().min(1)).min(1).optional(),
     channels: z.array(z.string().min(1)).optional(),
     from_users: z.array(z.string().min(1)).optional(),
+    /** GitHub repository associations whose holders may invoke the trigger. */
+    author_associations: z.array(GitHubAuthorAssociationSchema).min(1).optional(),
     inputs: z.record(z.string(), InputValueSchema).optional(),
     connection: z
       .string()
@@ -177,6 +190,7 @@ const StepSchema = z
     prompt: z.array(PromptBlockSchema).min(1),
     env: z.record(z.string().min(1), z.string()).optional(),
     github: AuthoredGitHubAuthoritySchema.optional(),
+    tools: IntegrationToolGrantsSchema.optional(),
     if: z.string().min(1).optional(),
     output: z.object({ schema: JsonSchemaSchema }).strict().optional(),
     allow_outputs: z.array(AllowOutputSchema).optional(),
@@ -256,6 +270,7 @@ export interface CompiledStep {
   prompt: readonly CompiledPromptBlock[];
   env?: Readonly<Record<string, string>> | undefined;
   github?: CompiledGitHubAuthority | undefined;
+  tools?: IntegrationToolGrants | undefined;
   condition?: Expression | undefined;
   output?: { schema: JsonValue } | undefined;
   allowOutputs: readonly { type: string; max?: number | undefined; required: boolean }[];
@@ -268,10 +283,17 @@ export type CompiledSteps = readonly CompiledStep[];
 export type CompiledTriggerFilter = Readonly<
   Omit<
     AuthoredTriggerFilter,
-    "channels" | "from_users" | "states" | "labels" | "exclude_labels" | "assignees"
+    | "channels"
+    | "from_users"
+    | "author_associations"
+    | "states"
+    | "labels"
+    | "exclude_labels"
+    | "assignees"
   > & {
     channels?: readonly string[] | undefined;
     from_users?: readonly string[] | undefined;
+    author_associations?: readonly GitHubAuthorAssociation[] | undefined;
     states?: readonly string[] | undefined;
     labels?: readonly string[] | undefined;
     exclude_labels?: readonly string[] | undefined;
@@ -407,6 +429,7 @@ const CompiledStepSchema: z.ZodType<CompiledStep> = z
     prompt: z.array(CompiledPromptBlockSchema).min(1),
     env: z.record(z.string(), z.string()).optional(),
     github: CompiledGitHubAuthoritySchema.optional(),
+    tools: CompiledIntegrationToolGrantsSchema.optional(),
     condition: z.custom<Expression>(isExpression).optional(),
     output: z.object({ schema: CompiledJsonSchemaSchema }).strict().optional(),
     allowOutputs: z.array(
@@ -619,6 +642,7 @@ function compileStep(
     prompt: compilePromptBlocks(trigger.name, step.id, step.prompt, resolvedPromptPartials),
     ...(env === undefined ? {} : { env }),
     ...(github === undefined ? {} : { github }),
+    ...(step.tools === undefined ? {} : { tools: normalizeIntegrationToolGrants(step.tools) }),
     ...(condition === undefined ? {} : { condition }),
     ...(outputDeclaration === undefined ? {} : { output: outputDeclaration }),
     allowOutputs: (step.allow_outputs ?? []).map((allowOutput) => ({
@@ -854,6 +878,7 @@ function validateExpressionContract(
 ): void {
   const environmentNames = new Set(environments.keys());
   const stepOrdinals = new Map(trigger.steps.map((step, ordinal) => [step.id, ordinal]));
+  const finiteTemplateValues = finiteTemplateResolver(trigger);
   const valueNames = new Set(Object.keys(trigger.values));
   const visiting = new Set<string>();
 
@@ -912,72 +937,6 @@ function validateExpressionContract(
         throw new Error(`step ${stepId} environment ${name} must be a daemon environment`);
       }
     }
-  }
-
-  function finiteTemplateValues(template: string, ordinal: number): readonly string[] | undefined {
-    let results = [""];
-    let cursor = 0;
-    while (cursor < template.length) {
-      const start = template.indexOf(EXPRESSION_START, cursor);
-      if (start < 0) return results.map((prefix) => prefix + template.slice(cursor));
-      const end = template.indexOf(EXPRESSION_END, start + EXPRESSION_START.length);
-      if (end < 0) return undefined;
-      const literal = template.slice(cursor, start);
-      const choices = finiteExpressionValues(
-        parseExpression(template.slice(start + EXPRESSION_START.length, end)),
-        ordinal,
-      );
-      if (choices === undefined) return undefined;
-      results = results.flatMap((prefix) =>
-        choices.map((choice) => prefix + literal + interpolatedValue(choice)),
-      );
-      cursor = end + EXPRESSION_END.length;
-    }
-    return [...new Set(results)];
-  }
-
-  function finiteExpressionValues(
-    expression: Expression,
-    ordinal: number,
-  ): readonly JsonValue[] | undefined {
-    if (expression.kind === "literal") return [expression.value];
-    if (expression.kind === "path") return finitePathValues(expression.value, ordinal);
-    if (expression.kind === "not") {
-      const values = finiteExpressionValues(expression.value, ordinal);
-      return values === undefined ? undefined : [...new Set(values.map((value) => !truthy(value)))];
-    }
-    const left = finiteExpressionValues(expression.left, ordinal);
-    const right = finiteExpressionValues(expression.right, ordinal);
-    if (left === undefined || right === undefined) return undefined;
-    const results: JsonValue[] = [];
-    for (const leftValue of left) {
-      for (const rightValue of right) {
-        results.push(finiteBinaryValue(expression.operator, leftValue, rightValue));
-      }
-    }
-    return uniqueJsonValues(results);
-  }
-
-  function finitePathValues(
-    reference: ExpressionPath,
-    ordinal: number,
-  ): readonly JsonValue[] | undefined {
-    if (reference.namespace === "paseo") {
-      if (!Array.isArray(reference.path)) return undefined;
-      const input = trigger.inputs[reference.path[1]];
-      if (input?.choices === undefined) return undefined;
-      return input.required || input.default !== undefined
-        ? input.choices
-        : [...input.choices, null];
-    }
-    if (reference.namespace === "values") {
-      const value = trigger.values[reference.name];
-      return value === undefined ? undefined : finiteExpressionValues(value, ordinal);
-    }
-    const referencedOrdinal = stepOrdinals.get(reference.stepId);
-    if (referencedOrdinal === undefined || referencedOrdinal >= ordinal) return undefined;
-    const output = trigger.steps[referencedOrdinal]?.output;
-    return output === undefined ? undefined : finiteSchemaChoices(output.schema, reference.path);
   }
 
   function validateValue(name: string, ordinal = Number.POSITIVE_INFINITY): void {
@@ -1125,6 +1084,106 @@ function compileAt<T>(path: readonly (string | number)[], operation: () => T): T
       { cause: error },
     );
   }
+}
+
+/**
+ * Every value a template in step `ordinal` can resolve to, when the trigger's inputs, values,
+ * and earlier step outputs prove it finite; `undefined` when they do not.
+ */
+function finiteTemplateResolver(
+  trigger: CompiledTrigger,
+): (template: string, ordinal: number) => readonly string[] | undefined {
+  const stepOrdinals = new Map(trigger.steps.map((step, ordinal) => [step.id, ordinal]));
+  return finiteTemplateValues;
+
+  function finiteTemplateValues(template: string, ordinal: number): readonly string[] | undefined {
+    let results = [""];
+    let cursor = 0;
+    while (cursor < template.length) {
+      const start = template.indexOf(EXPRESSION_START, cursor);
+      if (start < 0) return results.map((prefix) => prefix + template.slice(cursor));
+      const end = template.indexOf(EXPRESSION_END, start + EXPRESSION_START.length);
+      if (end < 0) return undefined;
+      const literal = template.slice(cursor, start);
+      const choices = finiteExpressionValues(
+        parseExpression(template.slice(start + EXPRESSION_START.length, end)),
+        ordinal,
+      );
+      if (choices === undefined) return undefined;
+      results = results.flatMap((prefix) =>
+        choices.map((choice) => prefix + literal + interpolatedValue(choice)),
+      );
+      cursor = end + EXPRESSION_END.length;
+    }
+    return [...new Set(results)];
+  }
+
+  function finiteExpressionValues(
+    expression: Expression,
+    ordinal: number,
+  ): readonly JsonValue[] | undefined {
+    if (expression.kind === "literal") return [expression.value];
+    if (expression.kind === "path") return finitePathValues(expression.value, ordinal);
+    if (expression.kind === "not") {
+      const values = finiteExpressionValues(expression.value, ordinal);
+      return values === undefined ? undefined : [...new Set(values.map((value) => !truthy(value)))];
+    }
+    const left = finiteExpressionValues(expression.left, ordinal);
+    const right = finiteExpressionValues(expression.right, ordinal);
+    if (left === undefined || right === undefined) return undefined;
+    const results: JsonValue[] = [];
+    for (const leftValue of left) {
+      for (const rightValue of right) {
+        results.push(finiteBinaryValue(expression.operator, leftValue, rightValue));
+      }
+    }
+    return uniqueJsonValues(results);
+  }
+
+  function finitePathValues(
+    reference: ExpressionPath,
+    ordinal: number,
+  ): readonly JsonValue[] | undefined {
+    if (reference.namespace === "paseo") {
+      if (!Array.isArray(reference.path)) return undefined;
+      const input = trigger.inputs[reference.path[1]];
+      if (input?.choices === undefined) return undefined;
+      return input.required || input.default !== undefined
+        ? input.choices
+        : [...input.choices, null];
+    }
+    if (reference.namespace === "values") {
+      const value = trigger.values[reference.name];
+      return value === undefined ? undefined : finiteExpressionValues(value, ordinal);
+    }
+    const referencedOrdinal = stepOrdinals.get(reference.stepId);
+    if (referencedOrdinal === undefined || referencedOrdinal >= ordinal) return undefined;
+    const output = trigger.steps[referencedOrdinal]?.output;
+    return output === undefined ? undefined : finiteSchemaChoices(output.schema, reference.path);
+  }
+}
+
+/**
+ * The environments and named agents a step can launch. Compilation already proved both
+ * selections finite, so this is exact for every compiled trigger.
+ */
+export function stepSelections(
+  trigger: CompiledTrigger,
+  ordinal: number,
+): { environments: readonly string[]; namedAgents: readonly string[] | undefined } {
+  const step = trigger.steps[ordinal];
+  if (step === undefined) throw new Error(`trigger ${trigger.name} has no step ${ordinal}`);
+  const finiteTemplateValues = finiteTemplateResolver(trigger);
+  const environments = finiteTemplateValues(step.environment, ordinal);
+  if (environments === undefined) {
+    throw new Error(`step ${step.id} environment must resolve from finite choices`);
+  }
+  if (!("selector" in step.agent)) return { environments, namedAgents: undefined };
+  const namedAgents = finiteTemplateValues(step.agent.selector, ordinal);
+  if (namedAgents === undefined) {
+    throw new Error(`step ${step.id} agent must resolve from finite choices`);
+  }
+  return { environments, namedAgents };
 }
 
 function truthy(value: JsonValue): boolean {
@@ -1387,6 +1446,12 @@ function validateAuthoredIds(config: AuthoredHubConfig): void {
 }
 
 function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
+  const associations = trigger.filters?.author_associations;
+  if (associations !== undefined && !reportsAuthorAssociation(trigger.on)) {
+    throw new Error(
+      `trigger ${trigger.name}: filters.author_associations is not available for ${trigger.on}`,
+    );
+  }
   if (isEditorEvent(trigger.on) && eventDefinition(trigger.on).origin === "hub") return;
   // A project scout is an intentionally autonomous, project-scoped policy. Every other
   // externally-originated Linear action remains actor-allowlisted below.
@@ -1398,9 +1463,15 @@ function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
     }
     return;
   }
-  if ((trigger.filters?.from_users?.length ?? 0) === 0) {
+  if ((trigger.filters?.from_users?.length ?? 0) > 0) return;
+  if (!reportsAuthorAssociation(trigger.on)) {
     throw new Error(
       `trigger ${trigger.name} requires a non-empty filters.from_users allowlist for externally sourced events`,
+    );
+  }
+  if (associations === undefined) {
+    throw new Error(
+      `trigger ${trigger.name} requires a non-empty filters.from_users or filters.author_associations allowlist for externally sourced events`,
     );
   }
 }

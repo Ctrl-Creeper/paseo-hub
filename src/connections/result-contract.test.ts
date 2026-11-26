@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import {
-  CONNECTIONS_RETURN_ROUTE,
+  INTEGRATIONS_RETURN_ROUTE,
   connectionReturnCopy,
   connectionReturnUrl,
   readConnectionReturn,
@@ -10,14 +10,14 @@ import {
 
 describe("connection return contract", () => {
   it("round-trips a return through the location it is carried in", () => {
-    const url = connectionReturnUrl("https://hub.test", "/o/acme/connections", {
+    const url = connectionReturnUrl("https://hub.test", "/o/acme/integrations", {
       provider: "github",
       result: "connection_unavailable",
       reference: "req-1",
     });
     assert.equal(
       url.toString(),
-      "https://hub.test/o/acme/connections?app=github&result=connection_unavailable&reference=req-1",
+      "https://hub.test/o/acme/integrations?app=github&result=connection_unavailable&reference=req-1",
     );
     assert.deepEqual(readConnectionReturn(url), {
       provider: "github",
@@ -28,16 +28,16 @@ describe("connection return contract", () => {
 
   it("only reads returns from providers it knows, and shows unknown results as failures", () => {
     assert.equal(
-      readConnectionReturn(new URL("https://hub.test/o/acme/connections?result=github_connected")),
+      readConnectionReturn(new URL("https://hub.test/o/acme/integrations?result=github_connected")),
       undefined,
     );
     assert.equal(
-      readConnectionReturn(new URL("https://hub.test/o/acme/connections?app=jira&result=x")),
+      readConnectionReturn(new URL("https://hub.test/o/acme/integrations?app=jira&result=x")),
       undefined,
     );
     assert.deepEqual(
       readConnectionReturn(
-        new URL("https://hub.test/o/acme/connections?app=slack&result=something_nobody_mapped"),
+        new URL("https://hub.test/o/acme/integrations?app=slack&result=something_nobody_mapped"),
       ),
       { provider: "slack", result: "connection_unavailable" },
     );
@@ -51,13 +51,13 @@ describe("connection return contract", () => {
   });
 
   it("falls back to the connections landing, never the dashboard landing", () => {
-    assert.equal(CONNECTIONS_RETURN_ROUTE, "/connections");
+    assert.equal(INTEGRATIONS_RETURN_ROUTE, "/integrations");
   });
 
   it("phrases every outcome with what happened and what to do next", () => {
     assert.deepEqual(connectionReturnCopy({ provider: "github", result: "github_connected" }), {
       tone: "success",
-      message: "GitHub connected.",
+      message: "GitHub connected",
     });
     const unauthenticated = connectionReturnCopy({
       provider: "github",
@@ -74,5 +74,22 @@ describe("connection return contract", () => {
     assert.equal(unavailable.tone, "error");
     assert.match(unavailable.message, /^Hub couldn't finish the Discord connection\./u);
     assert.match(unavailable.message, /quote reference req-9/u);
+  });
+
+  it("tells a person GitHub doesn't show as an owner apart from a link that expired", () => {
+    const notOwner = connectionReturnCopy({ provider: "github", result: "github_not_owner" });
+    assert.deepEqual(notOwner, {
+      tone: "error",
+      title: "GitHub wasn't connected",
+      message:
+        "GitHub doesn't show you as an owner of that account. Nothing was connected. Ask an owner to connect it, or pick an account you own",
+    });
+    const expired = connectionReturnCopy({ provider: "github", result: "connection_invalid" });
+    assert.match(expired.message, /^That connection link had already been used or had expired/u);
+    const rejected = connectionReturnCopy({
+      provider: "github",
+      result: "github_verification_rejected",
+    });
+    assert.doesNotMatch(rejected.message, /expired|owner/u);
   });
 });

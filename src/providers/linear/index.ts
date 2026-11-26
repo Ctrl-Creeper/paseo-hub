@@ -1,7 +1,7 @@
 import type { AuthServer } from "../../auth/server.js";
 import {
   CONNECTION_ATTEMPT_LIFETIME_MINUTES,
-  CONNECTIONS_RETURN_ROUTE,
+  INTEGRATIONS_RETURN_ROUTE,
   callbackConnectionAccess,
   cancelledConnectionResult,
   connectionAccess,
@@ -122,6 +122,8 @@ export function createLinearRegistration(
     ...(database === null
       ? {}
       : {
+          appUserId: async (linearOrganizationId) =>
+            (await database.findLinearConnection(linearOrganizationId))?.appUserId,
           canHydrateIssue: async (linearOrganizationId) => {
             const connection = await database.findLinearConnection(linearOrganizationId);
             return connection !== undefined && !linearConnectionRequiresReauthorization(connection);
@@ -327,10 +329,10 @@ async function completeAuthorization(
       provider: "linear",
       phase: "authorization",
       applicationBaseUrl: options.applicationBaseUrl,
-      returnRoute: CONNECTIONS_RETURN_ROUTE,
+      returnRoute: INTEGRATIONS_RETURN_ROUTE,
     });
   }
-  let returnRoute: string = CONNECTIONS_RETURN_ROUTE;
+  let returnRoute: string = INTEGRATIONS_RETURN_ROUTE;
   let callbackOrigin = options.applicationBaseUrl;
   try {
     const access = await callbackConnectionAccess(options.auth, request);

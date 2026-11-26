@@ -7,10 +7,10 @@ controls. `src/typography-policy.test.ts` enforces the parts a regex can see; th
 
 ## Hard rules
 
-1. **One weight.** Everything is 400. The only exception is `font-title`, and it goes on the one title
-   of a surface: the page `h1`, a dialog or sheet title, the auth card title. Never on a section
-   heading, a table header, a label, a button, a nav item, or a value. `font-medium`, `font-semibold`,
-   `font-bold`, `<strong>`, `<b>`, and `fontWeight` do not exist here.
+1. **One weight.** Everything is 400. The only exception is `font-title`, and it goes on surface
+   and group titles: the page `h1`, a `Section` or `Card` `h2`, a dialog or sheet title, and the
+   auth card title. Never on a table header, a label, a button, a nav item, a list row, or a value.
+   `font-medium`, `font-semibold`, `font-bold`, `<strong>`, `<b>`, and `fontWeight` do not exist here.
 2. **Emphasis is colour, not weight.** Three text steps: `text-foreground` for what the reader came
    for, `text-muted-foreground` for context, `text-extra-muted-foreground` for decoration that can be
    missed. Pick one per element. A primary line over a muted line is how a record shows two facts.
@@ -26,11 +26,14 @@ controls. `src/typography-policy.test.ts` enforces the parts a regex can see; th
    shape that does not exist there, add it there and use it from the screen. Never hand-roll a card,
    field, table, empty state, pill, header, or key/value row in a panel file. Fix the component, not
    the leaf.
+8. **Colour is state.** The page is monochrome. Hue appears only where it means something: a
+   `StatusPill` tone, a destructive action or error, the one `default` button on a surface, and the
+   focus ring. Text is never coloured to say "you can click this"; the control's shape says it.
 
 ## Tokens
 
 All tokens live in `src/styles.css`. Values come from Linear's measured ramp; Paseo green survives only
-as the link and focus hue.
+as the focus ring, the `primary` fill, and code-editor accents. Hub has no link colour.
 
 ### Surfaces and text
 
@@ -47,7 +50,7 @@ as the link and focus hue.
 | `border`                  | `#23252a`             | Every structural rule. Near invisible; that is the point.                                                                                        |
 | `input`                   | `#34343a`             | Control borders, one step stronger than `border`.                                                                                                |
 | `primary` / `-foreground` | `#1b4f4a` / `#bfe6da` | A dark teal fill with a pale mint label; the one place the brand hue is a surface.                                                               |
-| `link`                    | `#7ccba0`             | Text links and the focus ring. The one brand hue.                                                                                                |
+| `brand`                   | `#7ccba0`             | The focus ring and code-editor accents. Never text.                                                                                              |
 | `ring`                    | `#7ccba0`             | Focus. One pixel outline, two pixel offset, nothing else.                                                                                        |
 | `destructive`             | `#e8837a`             | Destructive button fill and error text.                                                                                                          |
 
@@ -62,15 +65,15 @@ light column correct anyway so a toggle is a one-line change.
 Tailwind's size names are remapped in `@theme` so shadcn markup keeps reading normally while rendering
 at Linear's density. Use the name for the role, not for the pixel.
 
-| Utility     | Size / line | Role                                                                                                                                       |
-| ----------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `text-xs`   | 12 / 16     | Meta lines, pills, table headers, field descriptions, timestamps.                                                                          |
-| `text-sm`   | 13 / 20     | The UI size. Body, cells, inputs, buttons, sidebar, section titles, descriptions. This is the `<body>` default; most elements set nothing. |
-| `text-base` | 15 / 24     | Dialog and auth card titles. Long prose if a screen ever has any.                                                                          |
-| `text-lg`   | 17 / 24     | Unused today. Do not reach for it to make something "a bit bigger".                                                                        |
-| `text-xl`   | 20 / 28     | The page title. `PageHeader` owns it.                                                                                                      |
-| `text-2xl`  | 24 / 32     | A figure: `StatTile` value, a price.                                                                                                       |
-| `text-3xl`  | 32 / 36     | The largest figure. One per screen at most.                                                                                                |
+| Utility     | Size / line | Role                                                                                                                               |
+| ----------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `text-xs`   | 12 / 16     | Meta lines, pills, table headers, field descriptions, timestamps.                                                                  |
+| `text-sm`   | 13 / 20     | The UI size. Body, cells, inputs, buttons, sidebar, labels, descriptions. This is the `<body>` default; most elements set nothing. |
+| `text-base` | 15 / 24     | `Section`, `Card`, dialog, sheet, and auth card titles (`font-title`). Long prose if a screen ever has any.                        |
+| `text-lg`   | 17 / 24     | Unused today. Do not reach for it to make something "a bit bigger".                                                                |
+| `text-xl`   | 20 / 28     | The page title. `PageHeader` owns it.                                                                                              |
+| `text-2xl`  | 24 / 32     | A figure: `StatTile` value, a price.                                                                                               |
+| `text-3xl`  | 32 / 36     | The largest figure. One per screen at most.                                                                                        |
 
 `font-title` is the single elevated weight (500). `tabular-nums` on every number that sits in a
 column — `DataTable` sets it for the whole table, so no cell decides this for itself.
@@ -100,21 +103,43 @@ background only.
 | Sidebar                 | 240px wide. Item h-8 `text-sm` `rounded-md`. Inactive `muted-foreground`; active `accent` fill and `foreground`. Hover promotes colour, no fill.                                                                                                                             |
 | Site header             | h-12, `border-b`, `background` fill, no blur. A route's own actions sit here from `sm`; a phone fits the sidebar trigger and the trail only, so the route puts the same controls in the page.                                                                                |
 | Table                   | Header row h-9 `text-xs muted-foreground`. Body row h-11 `text-sm`. Rows divided by `border`. Hover fill only on rows that navigate. A column is as wide as its widest value; only `fill` columns, the ones whose values can be cut, share the remaining width and truncate. |
-| Card                    | p-6. `rounded-xl border bg-card`. Title `text-sm` foreground, description `text-sm muted-foreground`, gap-1 between them, gap-4 to the body.                                                                                                                                 |
+| Card                    | p-6. `rounded-xl border bg-card`. Title `text-base font-title` foreground, description `text-sm muted-foreground`, gap-1 between them, gap-4 to the body.                                                                                                                    |
 | Page column             | `max-w-5xl`, inset p-4 on phones and p-8 from `md`. Owned by the shell; screens never pad themselves.                                                                                                                                                                        |
-| Section                 | mb-8 between sections, gap-3 inside. Owned by `Section`.                                                                                                                                                                                                                     |
+| Section                 | mb-8 between sections, gap-3 inside. Title `text-base font-title` foreground, description `text-sm muted-foreground`. Owned by `Section`.                                                                                                                                    |
 | Field                   | gap-2 between label, control, and description. Fields in a form: gap-4.                                                                                                                                                                                                      |
 
 ## Emphasis without weight
 
 - A record is a primary line over a muted line at the same size. Use `TwoLine`.
-- A group heading is `text-sm text-foreground` with its description in `muted-foreground` beneath it.
-  It is not bigger and not heavier than the rows below it; it is set apart by the gap above it.
+- A group or card heading is `text-base font-title text-foreground` with its description in
+  `text-sm text-muted-foreground` beneath it, separating headings from `text-sm` rows and labels.
+- `RecordList` always sits inside a `Card` so short lists share the same surface as tables and tiles.
+- UI copy (subtitles, descriptions, helper text, alerts, empty states) never ends with a trailing period.
 - Active navigation is a colour step at identical size and weight, plus the `accent` fill.
 - A number that matters is bigger, not bolder: `text-2xl` and `tabular-nums`.
 - A key/value pair is `text-xs muted-foreground` over `text-sm foreground`. Use `SummaryPanel`.
 - Table headers are `text-xs muted-foreground` in sentence case. They are the quietest text in the
   table.
+
+## Actions and links
+
+Every control reads as a control at rest, without colour. Pick by where it sits:
+
+| It sits                                                              | It is                                      |
+| -------------------------------------------------------------------- | ------------------------------------------ |
+| The one action a surface exists for                                  | `Button` (`default`)                       |
+| On its own: a section or card action, a footer, a row, a drawer      | `Button variant="outline" size="sm"`       |
+| An icon with no label: steppers, close, copy, kebab, pager           | `Button variant="ghost"` at an `icon` size |
+| Beside a filled or outline button to back out: Cancel, Do this later | `Button variant="ghost"`                   |
+| Inside a sentence, or a pre-auth card's footer line                  | `Button variant="link"`                    |
+| A record's name in a table cell or list row                          | A plain link, `hover:underline`            |
+
+- `link` is the foreground step with an underline in a tint of its own colour, so it stands out
+  from muted prose by brightness and by shape. It is for text, never for an action on its own.
+- A navigation action that stands alone is an outline button even when it only changes the page.
+  "All triggers", "Manage", "View runs", "Unmatched events" are buttons.
+- A record name is not styled as a link because the row is the control: it has a hover fill and
+  opens on click.
 
 ## Component roster
 
@@ -124,39 +149,43 @@ Everything a screen composes lives in `src/components/app`. The shadcn primitive
 primitives it is composing inside an app component. Anything else a screen wants from `ui` is a
 missing app component.
 
-| Component                                                               | The one way to                                                                      |
-| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `Page`, `PageHeader`, `PageHeaderSkeleton`                              | Lay out a screen: the column, the one `h1`, its description, status, and actions.   |
-| `Section`                                                               | Group content under a quiet heading with an optional trailing action.               |
-| `Card`, `CardSkeleton`                                                  | Put content in a bordered surface. Icon, title, description, and action optional.   |
-| `Steps`                                                                 | Number a run of cards in order and join them with a rail.                           |
-| `DataTable`, `DataRow`, `DataCell`, `DataTableSkeleton`                 | List records at page level, in columns.                                             |
-| `RecordList`, `RecordRow`                                               | List a card's own few records, with no header row to repeat the card's subject.     |
-| `TwoLine`                                                               | Show a primary fact over a muted secondary one, in a cell or a row.                 |
-| `SummaryPanel`                                                          | Show labelled facts as a description list.                                          |
-| `StatTile`, `StatGrid`                                                  | Show a figure with a label.                                                         |
-| `StatusPill`                                                            | Show state. Never `Badge`, never a coloured span.                                   |
-| `EmptyState`                                                            | Say there is nothing here and what to do about it.                                  |
-| `FormField`, `FieldSkeleton`                                            | Label a control, with optional description and error. Wraps any control.            |
-| `CheckboxField`                                                         | Label a checkbox beside its box, with what ticking it means underneath.             |
-| `FormActions`                                                           | The button row under a form: stacks on phones, right-aligns from `sm`.              |
-| `AuthForm`                                                              | A pre-auth form: fields, submit, optional secondary action, busy state.             |
-| `AuthActions`                                                           | The buttons under a pre-auth card with no form left to submit. Never `FormActions`. |
-| `FormDialog`                                                            | A dialog whose body is one form with one submit.                                    |
-| `ConfirmAction`, `ConfirmMenuItem`                                      | Ask before something irreversible.                                                  |
-| `FailureAlert`, `NoticeAlert`                                           | Show a failed request, or a neutral or success notice as a polite live region.      |
-| `WarningAlert`                                                          | Warn without blocking.                                                              |
-| `StatusLine`                                                            | A polite live region with reserved height.                                          |
-| `Spinner`, `LoadingLine`, `PanelSkeleton`                               | Wait. Skeletons for pages, a spinner for one fact.                                  |
-| `SegmentedControl`                                                      | Pick one of a few modes, with radio semantics.                                      |
-| `TabNav`, `TabNavSkeleton`                                              | Navigate between sibling routes under one page.                                     |
-| `Combobox`                                                              | Pick one of many with search.                                                       |
-| `CopyField`, `CopyButton`, `CopyBlock`, `CodeBlock`                     | Show a value to copy, or a block of code.                                           |
-| `Disclosure`                                                            | Open and close a bordered section.                                                  |
-| `RowActions`                                                            | Put a record's actions behind one kebab.                                            |
-| `RelativeTime`                                                          | Show when. There is no absolute-date formatter in screens.                          |
-| `AuthLayout`, `AuthCard`, `AuthCardSkeleton`                            | Frame a pre-auth screen.                                                            |
-| `SiteHeader`, `SiteHeaderActions`, `SidebarSwitcher`, `NavigationGroup` | The shell, in `src/shell`. Header actions render from `sm` up only.                 |
+| Component                                                               | The one way to                                                                        |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `Page`, `PageHeader`, `PageHeaderSkeleton`                              | Lay out a screen: the column, the one `h1`, its description, status, and actions.     |
+| `Section`                                                               | Group content under a quiet heading with an optional trailing action.                 |
+| `Card`, `CardSkeleton`                                                  | Put content in a bordered surface. Icon, title, description, action, footer optional. |
+| `Steps`                                                                 | Number a run of cards in order and join them with a rail.                             |
+| `ProgressSteps`                                                         | Walk a checklist inside a card, one open step at a time.                              |
+| `DataTable`, `DataRow`, `DataCell`, `DataTableSkeleton`                 | List records in columns, paged or ending in a pointer to what they leave out.         |
+| `RecordList`, `RecordRow`                                               | List a card's own few records, with no header row to repeat the card's subject.       |
+| `TwoLine`                                                               | Show a primary fact over a muted secondary one, in a cell or a row.                   |
+| `SummaryPanel`                                                          | Show labelled facts as a description list.                                            |
+| `StatTile`, `StatGrid`                                                  | Show a figure with a label, as a link to the records it counts.                       |
+| `StatusPill`                                                            | Show state. Never `Badge`, never a coloured span.                                     |
+| `EmptyState`                                                            | Say there is nothing here and what to do about it.                                    |
+| `FormField`, `FieldSkeleton`                                            | Label a control, with optional description and error. Wraps any control.              |
+| `CheckboxField`                                                         | Label a checkbox beside its box, with what ticking it means underneath.               |
+| `FormActions`                                                           | The button row under a form: stacks on phones, right-aligns from `sm`.                |
+| `AuthForm`                                                              | A pre-auth form: fields, submit, optional secondary action, busy state.               |
+| `AuthActions`                                                           | The buttons under a pre-auth card with no form left to submit. Never `FormActions`.   |
+| `FormDialog`                                                            | A dialog whose body is one form with one submit.                                      |
+| `ConfirmAction`, `ConfirmMenuItem`                                      | Ask before something irreversible.                                                    |
+| `FailureAlert`, `NoticeAlert`                                           | Show a failed request, or a neutral or success notice as a polite live region.        |
+| `WarningAlert`                                                          | Warn without blocking.                                                                |
+| `StatusLine`                                                            | A polite live region with reserved height.                                            |
+| `Spinner`, `LoadingLine`, `PanelSkeleton`                               | Wait. Skeletons for pages, a spinner for one fact.                                    |
+| `SegmentedControl`                                                      | Pick one of a few modes, with radio semantics.                                        |
+| `TabNav`, `TabNavSkeleton`                                              | Navigate between sibling routes under one page.                                       |
+| `Combobox`                                                              | Pick one of many with search.                                                         |
+| `CopyField`, `CopyButton`, `CopyBlock`, `CodeBlock`                     | Show a value to copy, or a block of code.                                             |
+| `CopyPageLink`                                                          | Copy the view's address, or say where to find it if blocked.                          |
+| `Disclosure`                                                            | Open and close a bordered section.                                                    |
+| `RowActions`                                                            | Put a record's actions behind one kebab.                                              |
+| `DetailSheet`                                                           | Open one record beside its list, stepping with `j` and `k`.                           |
+| `FilterBar`, `FilterSelect`, `FilterSearch`                             | Narrow a list from one row of filters above it.                                       |
+| `RelativeTime`                                                          | Show when. There is no absolute-date formatter in screens.                            |
+| `AuthLayout`, `AuthCard`, `AuthCardSkeleton`                            | Frame a pre-auth screen.                                                              |
+| `SiteHeader`, `SiteHeaderActions`, `SidebarSwitcher`, `NavigationGroup` | The shell, in `src/shell`. Header actions render from `sm` up only.                   |
 
 Rules for the roster:
 

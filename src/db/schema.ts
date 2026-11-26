@@ -41,6 +41,14 @@ export type MachineSource =
 export const machineStatus = pgEnum("machine_status", MACHINE_STATUSES);
 export const agentExecutionStatus = pgEnum("agent_execution_status", AGENT_EXECUTION_STATUSES);
 
+/**
+ * The drop codes Activity lists as unmatched events. Spelled as SQL once, so both partial indexes
+ * and the queries that must match their predicate to use them agree.
+ */
+const UNMATCHED_DROP_REASONS = sql.raw(
+  "'no_project_route', 'no_trigger_for_source', 'trigger_filters_rejected', 'configuration_unavailable'",
+);
+
 export const providerEventReceipts = pgTable(
   "provider_event_receipts",
   {
@@ -49,7 +57,7 @@ export const providerEventReceipts = pgTable(
       .notNull()
       .references(() => organizations.id, { onDelete: "cascade" }),
     provider: text()
-      .$type<(typeof CONNECTION_PROVIDERS)[number] | "manual" | "schedule">()
+      .$type<(typeof CONNECTION_PROVIDERS)[number] | "manual" | "schedule" | "webhook">()
       .notNull(),
     connectionId: uuid("connection_id"),
     resourceId: text("resource_id"),
@@ -86,9 +94,17 @@ export const providerEventReceipts = pgTable(
       table.connectionId,
       table.resourceId,
     ),
+    // Activity's unmatched-events list reads only dropped receipts, newest first. Partial, so the
+    // index stays the size of the drops rather than of every delivery the organization receives.
+    index("provider_event_receipts_org_unmatched_received_idx")
+      .on(table.organizationId, table.receivedAt.desc(), table.id.desc())
+      .where(sql`${table.droppedReason} in (${UNMATCHED_DROP_REASONS})`),
+    index("provider_event_receipts_org_provider_unmatched_received_idx")
+      .on(table.organizationId, table.provider, table.receivedAt.desc(), table.id.desc())
+      .where(sql`${table.droppedReason} in (${UNMATCHED_DROP_REASONS})`),
     check(
       "provider_event_receipts_provider_check",
-      sql`${table.provider} in ('github', 'slack', 'discord', 'linear', 'manual', 'schedule')`,
+      sql`${table.provider} in ('github', 'slack', 'discord', 'linear', 'manual', 'schedule', 'webhook')`,
     ),
   ],
 );
@@ -440,6 +456,13 @@ export const triggerRuns = pgTable(
     terminalNotificationLeaseExpiresAt: timestamp("terminal_notification_lease_expires_at", {
       withTimezone: true,
     }),
+    terminalNotificationAttempts: integer("terminal_notification_attempts").notNull().default(0),
+    terminalNotificationNextAttemptAt: timestamp("terminal_notification_next_attempt_at", {
+      withTimezone: true,
+    }),
+    terminalNotificationAbandonedAt: timestamp("terminal_notification_abandoned_at", {
+      withTimezone: true,
+    }),
     rejection: jsonb(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     completedAt: timestamp("completed_at", { withTimezone: true }),
@@ -452,6 +475,17 @@ export const triggerRuns = pgTable(
     ),
     index("trigger_runs_status_deadline_idx").on(table.status, table.deadlineAt),
     index("trigger_runs_project_created_idx").on(table.projectId, table.createdAt.desc()),
+    index("trigger_runs_org_created_idx").on(
+      table.organizationId,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
+    index("trigger_runs_org_status_created_idx").on(
+      table.organizationId,
+      table.status,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
     index("trigger_runs_terminal_notification_idx").on(
       table.terminalNotificationDeliveredAt,
       table.terminalNotificationLeaseExpiresAt,
@@ -550,9 +584,17 @@ export const workflowWakeups = pgTable(
     triggerRunId: uuid("trigger_run_id").primaryKey(),
     availableAt: timestamp("available_at", { withTimezone: true }).notNull(),
     leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    /**
+     * Set while the run waits for an offline daemon. A worker holding that daemon's connection
+     * claims the wakeup before `available_at`, which is only the retry for everyone else.
+     */
+    waitingForDaemonId: uuid("waiting_for_daemon_id"),
   },
   (table) => [
     index("workflow_wakeups_available_lease_idx").on(table.availableAt, table.leaseExpiresAt),
+    index("workflow_wakeups_waiting_daemon_idx")
+      .on(table.waitingForDaemonId)
+      .where(sql`${table.waitingForDaemonId} is not null`),
     foreignKey({
       columns: [table.triggerRunId],
       foreignColumns: [triggerRuns.id],
@@ -751,6 +793,7 @@ export const agentExecutions = pgTable(
     index("agent_executions_machine_id_idx").on(table.machineId),
     index("agent_executions_project_started_at_idx").on(table.projectId, table.startedAt.desc()),
     index("agent_executions_status_idx").on(table.status),
+    index("agent_executions_workflow_step_run_idx").on(table.workflowStepRunId),
     check(
       "agent_executions_hub_action_check",
       sql`${table.hubAction} is null or ${table.hubAction} in ('interrupt', 'archive')`,
@@ -866,6 +909,7 @@ export const organizationConnectionAttempts = pgTable(
       .$type<
         | "github_setup"
         | "github_user_authorization"
+        | "github_selection"
         | "discord_authorization"
         | "slack_authorization"
         | "linear_authorization"
@@ -884,6 +928,7 @@ export const organizationConnectionAttempts = pgTable(
       .references(() => sessions.id, { onDelete: "cascade" }),
     candidateExternalId: text("candidate_external_id"),
     pkceVerifier: text("pkce_verifier"),
+    installationChoices: jsonb("installation_choices"),
     configurationVersion: integer("configuration_version").notNull(),
     providerApplicationId: text("provider_application_id"),
     callbackOrigin: text("callback_origin").notNull(),
@@ -902,15 +947,16 @@ export const organizationConnectionAttempts = pgTable(
     ),
     check(
       "organization_connection_attempts_phase_check",
-      sql`${table.phase} in ('github_setup', 'github_user_authorization', 'discord_authorization', 'slack_authorization', 'linear_authorization')`,
+      sql`${table.phase} in ('github_setup', 'github_user_authorization', 'github_selection', 'discord_authorization', 'slack_authorization', 'linear_authorization')`,
     ),
     check(
       "organization_connection_attempts_shape_check",
-      sql`(${table.phase} = 'github_setup' and ${table.provider} = 'github' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null)
-        or (${table.phase} = 'github_user_authorization' and ${table.provider} = 'github' and ${table.candidateExternalId} is not null and (${table.pkceVerifier} is not null or ${table.consumedAt} is not null))
-        or (${table.phase} = 'discord_authorization' and ${table.provider} = 'discord' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null)
-        or (${table.phase} = 'slack_authorization' and ${table.provider} = 'slack' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null)
-        or (${table.phase} = 'linear_authorization' and ${table.provider} = 'linear' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null)`,
+      sql`(${table.phase} = 'github_setup' and ${table.provider} = 'github' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null and ${table.installationChoices} is null)
+        or (${table.phase} = 'github_user_authorization' and ${table.provider} = 'github' and (${table.pkceVerifier} is not null or ${table.consumedAt} is not null) and ${table.installationChoices} is null)
+        or (${table.phase} = 'github_selection' and ${table.provider} = 'github' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null and ${table.installationChoices} is not null)
+        or (${table.phase} = 'discord_authorization' and ${table.provider} = 'discord' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null and ${table.installationChoices} is null)
+        or (${table.phase} = 'slack_authorization' and ${table.provider} = 'slack' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null and ${table.installationChoices} is null)
+        or (${table.phase} = 'linear_authorization' and ${table.provider} = 'linear' and ${table.candidateExternalId} is null and ${table.pkceVerifier} is null and ${table.installationChoices} is null)`,
     ),
   ],
 );
@@ -1469,6 +1515,16 @@ export const triggerSchedules = pgTable(
   },
   (table) => [index("trigger_schedules_due_idx").on(table.nextAt)],
 );
+
+export const triggerWebhooks = pgTable("trigger_webhooks", {
+  triggerId: uuid("trigger_id")
+    .primaryKey()
+    .references(() => organizationTriggers.id, { onDelete: "cascade" }),
+  endpointId: text("endpoint_id").notNull().unique(),
+  secretHash: text("secret_hash"),
+  windowStartedAt: timestamp("window_started_at", { withTimezone: true }),
+  windowCount: integer("window_count").notNull().default(0),
+});
 
 export const executionAuthorities = pgTable("execution_authorities", {
   executionId: uuid("execution_id")

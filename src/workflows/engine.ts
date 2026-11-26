@@ -16,6 +16,7 @@ import { parseCompiledHubConfig, type JsonPrimitive, type JsonValue } from "../c
 import { triggerDocumentName, type CompiledProjectConfiguration } from "../configuration/store.js";
 import { logger as defaultLogger } from "../logger.js";
 import { reportFailure } from "../failures/index.js";
+import { nextTerminalNotificationAttempt } from "./terminal-notification-retry.js";
 import { durableExecutionId } from "../daemons/lifecycle.js";
 import { EntitlementDenied } from "../entitlements/catalog.js";
 import { encodeEntitlementDenialFailureReason } from "../entitlements/denial.js";
@@ -48,6 +49,11 @@ import type { Logger } from "pino";
 
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
+/**
+ * How long a run waits for an offline daemon before a worker looks at it again. A worker that
+ * holds the daemon's connection claims it on its next tick, so this only bounds re-evaluation.
+ */
+const OFFLINE_DAEMON_RETRY_MS = 30_000;
 
 type AcceptedWorkflowRun = Extract<
   Awaited<ReturnType<Database["findTriggerRunById"]>>,
@@ -73,7 +79,8 @@ export interface DurableWorkflowEngineOptions {
   entitlements: EntitlementsService | null;
   providers?: readonly TriggerProvider[];
   dispatchLaunchMachineIntent?: (intent: LaunchMachineIntent) => Promise<unknown>;
-  canDispatchToDaemon?: (daemonId: string) => boolean;
+  /** The daemons this process holds a connection to. Omitted, every daemon is dispatchable. */
+  dispatchableDaemonIds?: () => readonly string[];
   validateLaunchMachineIntent?: (intent: LaunchMachineIntent) => void;
   configurationRevisionId?: string;
   leaseMs?: number;
@@ -95,6 +102,7 @@ export class DurableWorkflowEngine {
   private processing: Promise<void> | undefined;
   private terminalNotificationProcessing: Promise<void> | undefined;
   private terminalNotificationRecoveryRequested = false;
+  private readonly reactionQueues = new Map<string, Promise<void>>();
   private stopped = false;
 
   constructor(private readonly options: DurableWorkflowEngineOptions) {
@@ -124,6 +132,7 @@ export class DurableWorkflowEngine {
     this.workerTimer = undefined;
     await this.processing;
     await this.terminalNotificationProcessing;
+    await Promise.all(this.reactionQueues.values());
   }
 
   async enqueue(trigger: DurableProviderEvent): Promise<TriggerDispatchOutcome> {
@@ -232,19 +241,22 @@ export class DurableWorkflowEngine {
     await this.recoverWorkflowDeadlines(this.now());
     this.kickTerminalNotificationRecovery();
     await database.recoverWorkflowWakeups(this.now());
-    const visited: string[] = [];
     while (!this.stopped) {
-      const wakeup = await database.claimWorkflowWakeup(this.now(), this.leaseMs, visited);
+      const wakeup = await database.claimWorkflowWakeup(
+        this.now(),
+        this.leaseMs,
+        this.options.dispatchableDaemonIds?.() ?? [],
+      );
       if (wakeup === undefined) return;
       try {
-        if ((await this.processWakeup(wakeup)) === "deferred") visited.push(wakeup.triggerRunId);
+        await this.processWakeup(wakeup);
       } catch (error) {
         this.report(error, "workflow.wakeup.process", { triggerRunId: wakeup.triggerRunId });
       }
     }
   }
 
-  private async processWakeup(wakeup: WorkflowWakeupRecord): Promise<"deferred" | void> {
+  private async processWakeup(wakeup: WorkflowWakeupRecord): Promise<void> {
     const database = this.options.database;
     if (database === null) return;
     const prepared = await this.prepareWorkflowWakeup(wakeup);
@@ -311,7 +323,7 @@ export class DurableWorkflowEngine {
     );
     if (preparedIntent === undefined) return;
     const { executionId, intent } = preparedIntent;
-    if (await this.deferUnavailableDispatch(intent, wakeup)) return "deferred";
+    if (await this.deferUnavailableDispatch(intent, wakeup)) return;
     if (await this.failInvalidLaunchIntent(database, run, step, intent)) return;
     const reservation = await this.reserveExecution(run.organizationId);
     const created = await database.createWorkflowStepExecution({
@@ -379,11 +391,14 @@ export class DurableWorkflowEngine {
     intent: LaunchMachineIntent,
     wakeup: WorkflowWakeupRecord,
   ): Promise<boolean> {
-    if (this.options.canDispatchToDaemon?.(intent.environment.daemonId) !== false) return false;
-    await this.options.database!.releaseWorkflowWakeup(
+    const daemonId = intent.environment.daemonId;
+    const dispatchable = this.options.dispatchableDaemonIds?.();
+    if (dispatchable === undefined || dispatchable.includes(daemonId)) return false;
+    const now = this.now();
+    await this.options.database!.deferWorkflowWakeupForDaemon(
       wakeup.triggerRunId,
-      this.now(),
       wakeup.leaseExpiresAt!,
+      { daemonId, releasedAt: now, retryAt: new Date(now.getTime() + OFFLINE_DAEMON_RETRY_MS) },
     );
     return true;
   }
@@ -399,7 +414,7 @@ export class DurableWorkflowEngine {
     await database.linkWorkflowStepRunExecution(stepRunId, executionId, intent);
     if (steps.some((candidate) => candidate.startedAt !== null)) return;
     const started = await database.findTriggerRunById(triggerRunId);
-    if (started?.outcome === "accepted") await this.deliverWorkflowRunStarted(started);
+    if (started?.outcome === "accepted") void this.deliverWorkflowRunStarted(started);
   }
 
   /**
@@ -709,32 +724,63 @@ export class DurableWorkflowEngine {
     return Promise.resolve();
   }
 
-  private async deliverWorkflowRunAccepted(run: AcceptedTriggerRunRecord): Promise<void> {
-    const callback = this.options.onWorkflowRunAccepted;
-    if (callback === undefined || this.options.database === null) return;
-    try {
-      const result = await callback(run);
-      await this.options.database.setWorkflowRunReactionState(
-        run.id,
-        result === undefined ? run.reactionState : result,
-      );
-    } catch (error: unknown) {
-      this.report(error, "workflow.reaction.accepted", { triggerRunId: run.id });
-    }
+  private runSerializedReaction(triggerRunId: string, work: () => Promise<void>): Promise<void> {
+    const previous = this.reactionQueues.get(triggerRunId) ?? Promise.resolve();
+    const run = previous.then(work);
+    const tail = run.catch(() => {});
+    this.reactionQueues.set(triggerRunId, tail);
+    void tail.finally(() => {
+      if (this.reactionQueues.get(triggerRunId) === tail) {
+        this.reactionQueues.delete(triggerRunId);
+      }
+    });
+    return run;
   }
 
-  private async deliverWorkflowRunStarted(run: AcceptedTriggerRunRecord): Promise<void> {
+  private deliverWorkflowRunAccepted(run: AcceptedTriggerRunRecord): Promise<void> {
+    const callback = this.options.onWorkflowRunAccepted;
+    const database = this.options.database;
+    if (callback === undefined || database === null) return Promise.resolve();
+    return this.runSerializedReaction(run.id, async () => {
+      const current = await database.findTriggerRunById(run.id);
+      if (
+        current?.outcome !== "accepted" ||
+        current.status !== "running" ||
+        current.reactionState !== null
+      ) {
+        return;
+      }
+      try {
+        const result = await callback(current);
+        await database.setWorkflowRunReactionState(
+          current.id,
+          result === undefined ? current.reactionState : result,
+        );
+      } catch (error: unknown) {
+        this.report(error, "workflow.reaction.accepted", { triggerRunId: current.id });
+      }
+    });
+  }
+
+  private deliverWorkflowRunStarted(run: AcceptedTriggerRunRecord): Promise<void> {
     const callback = this.options.onWorkflowRunStarted;
-    if (callback === undefined || this.options.database === null) return;
-    try {
-      const result = await callback(run);
-      await this.options.database.setWorkflowRunReactionState(
-        run.id,
-        result === undefined ? run.reactionState : result,
-      );
-    } catch (error: unknown) {
-      this.report(error, "workflow.reaction.started", { triggerRunId: run.id });
-    }
+    const database = this.options.database;
+    if (callback === undefined || database === null) return Promise.resolve();
+    return this.runSerializedReaction(run.id, async () => {
+      const current = await database.findTriggerRunById(run.id);
+      if (current?.outcome !== "accepted" || current.terminalNotificationDeliveredAt !== null) {
+        return;
+      }
+      try {
+        const result = await callback(current);
+        await database.setWorkflowRunReactionState(
+          current.id,
+          result === undefined ? current.reactionState : result,
+        );
+      } catch (error: unknown) {
+        this.report(error, "workflow.reaction.started", { triggerRunId: current.id });
+      }
+    });
   }
 
   private kickTerminalNotificationRecovery(): void {
@@ -763,24 +809,59 @@ export class DurableWorkflowEngine {
   private async recoverPendingWorkflowRunTerminalNotifications(): Promise<void> {
     const database = this.options.database;
     if (database === null) return;
+    const inFlight: Promise<void>[] = [];
     while (!this.stopped) {
       const run = await database.claimPendingWorkflowRunTerminalNotification(
         this.now(),
         this.leaseMs,
       );
-      if (run === undefined) return;
-      try {
-        const reactionState = await this.options.onWorkflowRunTerminal?.(run);
-        const deliveredReactionState =
-          reactionState === undefined ? terminalReactionState(run) : reactionState;
-        await database.markWorkflowRunTerminalNotificationDelivered(
-          run.id,
-          this.now(),
-          deliveredReactionState,
-        );
-      } catch (error) {
-        this.report(error, "workflow.notification.terminal.deliver", { triggerRunId: run.id });
+      if (run === undefined) break;
+      inFlight.push(
+        this.runSerializedReaction(run.id, async () => {
+          const latest = await database.findTriggerRunById(run.id);
+          const terminalRun = latest?.outcome === "accepted" ? latest : run;
+          const reactionState = await this.options.onWorkflowRunTerminal?.(terminalRun);
+          const deliveredReactionState =
+            reactionState === undefined ? terminalReactionState(terminalRun) : reactionState;
+          await database.markWorkflowRunTerminalNotificationDelivered(
+            run.id,
+            this.now(),
+            deliveredReactionState,
+          );
+        }).catch((error: unknown) => this.settleFailedTerminalNotification(run, error)),
+      );
+    }
+    await Promise.all(inFlight);
+  }
+
+  /** Logs the failed attempt once, then either schedules the next attempt or abandons. */
+  private async settleFailedTerminalNotification(
+    run: AcceptedTriggerRunRecord,
+    error: unknown,
+  ): Promise<void> {
+    const database = this.options.database;
+    if (database === null) return;
+    const attempts = run.terminalNotificationAttempts;
+    const next = nextTerminalNotificationAttempt(error, attempts, this.now());
+    this.report(
+      error,
+      next.abandon
+        ? "workflow.notification.terminal.abandon"
+        : "workflow.notification.terminal.deliver",
+      {
+        triggerRunId: run.id,
+        attempts,
+        ...(next.abandon ? {} : { retryAt: next.retryAt.toISOString() }),
+      },
+    );
+    try {
+      if (next.abandon) {
+        await database.abandonWorkflowRunTerminalNotification(run.id, this.now());
+      } else {
+        await database.retryWorkflowRunTerminalNotification(run.id, next.retryAt);
       }
+    } catch (settleError: unknown) {
+      this.report(settleError, "workflow.notification.terminal.settle", { triggerRunId: run.id });
     }
   }
 
@@ -970,6 +1051,7 @@ function buildStepIntent(
       },
       ...(step.env === undefined ? {} : { env: step.env }),
       ...(step.github === undefined ? {} : { github: step.github }),
+      ...(step.tools === undefined ? {} : { tools: step.tools }),
       ...(step.title === undefined
         ? {}
         : { title: renderExecutionTemplate(step.title, executionId) }),

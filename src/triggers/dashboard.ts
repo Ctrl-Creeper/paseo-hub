@@ -1,18 +1,22 @@
+import type { TriggerLastRun } from "../activity/index.js";
 import type { AuthServer } from "../auth/server.js";
 import { capabilitiesFor } from "../auth/organization-policy.js";
 import type { Database, OrganizationTriggerRecord } from "../db/types.js";
 import { resolveRouteTenant } from "../projects/access.js";
+import { TRUSTED_REQUEST_ORIGIN_HEADER } from "../http/request-origin.js";
 import { ProjectCommandError } from "../projects/command-error.js";
-import { parseCompiledHubConfig } from "../config/compiler.js";
 import type { DaemonAgentConfigurationValidator } from "../configuration/store.js";
 import { projectTriggerForm } from "./configuration/editor.js";
-import { OrganizationTriggerStore } from "./store.js";
+import { eventProvider } from "./configuration/events.js";
+import { configuredTriggerEvents, OrganizationTriggerStore } from "./store.js";
+import type { WebhookSecretAction } from "./webhook/index.js";
 
 export class TriggerDashboard {
   constructor(
     private readonly database: Database,
     private readonly auth: AuthServer,
     private readonly agentValidator: DaemonAgentConfigurationValidator,
+    private readonly publicBaseUrl?: string,
   ) {}
 
   async snapshot(request: Request, organizationSlug: string) {
@@ -24,17 +28,13 @@ export class TriggerDashboard {
       tenant.organization.id,
       this.agentValidator,
     );
-    const [triggers, daemons, connections] = await Promise.all([
+    const [triggers, daemons, connections, webhooks, lastRuns] = await Promise.all([
       store.list(),
       this.database.listDaemonsForOrganization(tenant.organization.id),
       this.database.organizationConnectionUsage(tenant.organization.id),
+      this.database.webhooks.list(tenant.organization.id),
+      this.database.activity.lastRuns(tenant.organization.id),
     ]);
-    const activity = (
-      await Promise.all(triggers.map((trigger) => this.activityForTrigger(trigger)))
-    )
-      .flat()
-      .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt))
-      .slice(0, 100);
     return {
       organization: tenant.organization,
       canManage: capabilitiesFor(tenant.membership.role).manageResources,
@@ -43,11 +43,14 @@ export class TriggerDashboard {
           triggerView(
             store,
             trigger,
-            activity.find(({ triggerId }) => triggerId === trigger.id),
+            lastRuns.find(({ triggerId }) => triggerId === trigger.id),
           ),
         ),
       ),
-      activity,
+      webhooks,
+      webhookOrigin: new URL(
+        request.headers.get(TRUSTED_REQUEST_ORIGIN_HEADER) ?? this.publicBaseUrl ?? request.url,
+      ).origin,
       // Only a daemon that can run agents is a target; one enrolled without `hub.execute` would
       // be refused at save, and Home says how to grant it.
       daemons: daemons
@@ -84,38 +87,19 @@ export class TriggerDashboard {
     };
   }
 
-  private async activityForTrigger(trigger: OrganizationTriggerRecord) {
-    const migrationRevision = await this.database.findOrganizationTriggerMigrationRevision(
-      trigger.id,
-    );
-    const evidence = record(migrationRevision?.sourceEvidence);
-    const legacyProjectId = string(evidence?.["legacyProjectId"]);
-    const legacyTriggerName =
-      migrationRevision === undefined
-        ? undefined
-        : parseCompiledHubConfig(migrationRevision.normalizedConfiguration).triggers[0]?.name;
-    const [current, historical] = await Promise.all([
-      this.database.listProjectActivityRuns(trigger.runtimeProjectId, 100),
-      legacyProjectId === undefined
-        ? Promise.resolve([])
-        : this.database.listProjectActivityRuns(legacyProjectId, 100),
-    ]);
-    return [...current, ...historical]
-      .filter(
-        ({ run }) =>
-          current.some((candidate) => candidate.run.id === run.id) ||
-          run.configuredTriggerName === legacyTriggerName,
-      )
-      .map(({ run, receipt }) => ({
-        id: run.id,
-        triggerId: trigger.id,
-        triggerName: trigger.name,
-        provider: receipt.provider,
-        source: receipt.source,
-        repo: receipt.repo,
-        status: run.status,
-        receivedAt: receipt.receivedAt.toISOString(),
-      }));
+  async rotateWebhookSecret(
+    request: Request,
+    organizationSlug: string,
+    triggerId: string,
+    action: WebhookSecretAction = "rotate",
+  ) {
+    const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    if (!capabilitiesFor(tenant.membership.role).manageResources) {
+      throw new ProjectCommandError("forbidden");
+    }
+    return this.database.webhooks.rotate(tenant.organization.id, triggerId, action);
   }
 
   async save(
@@ -144,17 +128,16 @@ export class TriggerDashboard {
 async function triggerView(
   store: OrganizationTriggerStore,
   trigger: OrganizationTriggerRecord,
-  lastTriggered:
-    | { provider: string; source: string; status: string; receivedAt: string }
-    | undefined,
+  lastRun: TriggerLastRun | undefined,
 ) {
   const revision = await store.activeRevision(trigger);
   const evidence = record(revision.sourceEvidence);
-  const event = triggerEvent(revision.yaml, lastTriggered?.source);
-  const operational =
-    lastTriggered === undefined
+  const event = configuredTriggerEvents(trigger.format, revision)[0] ?? "manual.run";
+  const provider = eventProvider(event);
+  const lastTriggered =
+    lastRun === undefined
       ? null
-      : { status: lastTriggered.status, receivedAt: lastTriggered.receivedAt };
+      : { status: lastRun.status, receivedAt: lastRun.receivedAt.toISOString() };
   if (trigger.format === "legacy_multistep") {
     return {
       id: trigger.id,
@@ -166,8 +149,8 @@ async function triggerView(
       blockers: stringArray(evidence?.["conversionBlockers"]),
       draft: null,
       event,
-      provider: triggerProvider(event, lastTriggered?.provider),
-      lastTriggered: operational,
+      provider,
+      lastTriggered,
     };
   }
   const projection = projectTriggerForm(revision.yaml);
@@ -180,37 +163,10 @@ async function triggerView(
     updatedAt: trigger.updatedAt.toISOString(),
     blockers: [],
     draft: projection.status === "editable" ? projection.value : null,
-    event: projection.status === "editable" ? projection.value.event : event,
-    provider: triggerProvider(
-      projection.status === "editable" ? projection.value.event : event,
-      lastTriggered?.provider,
-    ),
-    lastTriggered: operational,
+    event,
+    provider,
+    lastTriggered,
   };
-}
-
-function triggerEvent(yaml: string, fallback: string | undefined): string {
-  const inline = /^on:\s+([a-z]+(?:\.[a-z_]+)+)\s*$/mu.exec(yaml)?.[1];
-  if (inline !== undefined) return inline;
-  const nested = /^on:\s*$[\s\S]*?^\s{2}([a-z]+(?:\.[a-z_]+)+):\s*$/mu.exec(yaml)?.[1];
-  return nested ?? fallback ?? "manual.run";
-}
-
-function triggerProvider(
-  event: string,
-  fallback: string | undefined,
-): "github" | "discord" | "slack" | "linear" | "manual" | "schedule" {
-  const provider = event.split(".")[0] ?? fallback;
-  if (
-    provider === "schedule" ||
-    provider === "github" ||
-    provider === "discord" ||
-    provider === "slack" ||
-    provider === "linear"
-  ) {
-    return provider;
-  }
-  return "manual";
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -223,8 +179,4 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((entry): entry is string => typeof entry === "string")
     : [];
-}
-
-function string(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
 }

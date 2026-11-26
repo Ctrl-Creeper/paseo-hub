@@ -1,3 +1,4 @@
+import { createExecutionLauncher } from "../agent-executions/launcher.js";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, it } from "vitest";
@@ -22,7 +23,7 @@ import { composeEntitlements, type ComposedEntitlements } from "./entitlements.j
 import { OrganizationCliCredentials, cliCredentialParts } from "./cli-credentials.js";
 import { createGitHubRegistration } from "../providers/github/index.js";
 import type { ProviderConnectionRegistration } from "../providers/registration.js";
-import { GitHubProviderPort, githubInstallation } from "../test-utils/github-connection.js";
+import { FakeGitHub, fakeGitHubConnectionClient } from "../test-utils/fake-github.js";
 import { API_KEY_SCOPES } from "./api-key-contract.js";
 import type { InvitationEmail, InvitationMailer } from "../invitations/index.js";
 
@@ -65,6 +66,41 @@ describe("account and organization boundary", () => {
       { name: "Default", slug: "default", createdByEmail: "alice@example.com" },
     ]);
     assert.equal(await alice.createOrganizationWithMetadata(), 400);
+  });
+
+  it("opens a recorded agent only for a member of the execution's organization", async () => {
+    const hub = await startAccounts(postgres);
+    const owner = await hub.signUp("Owner", "launcher-owner@example.com");
+    const studio = await owner.createOrganization("Private Studio");
+    const resources = await hub.seedResources(studio, "launcher");
+    await owner.createOrganization("Other Studio");
+    const outsider = await hub.signUp("Outsider", "launcher-outsider@example.com");
+    await outsider.createOrganization("Outsider Studio");
+    const path = `/open/executions/${resources.execution}`;
+    const anonymous = await hub.openExecution(new Request(`http://localhost:3000${path}`));
+    assert.equal(anonymous.status, 303);
+    assert.equal(anonymous.headers.get("location"), `/?openExecution=${resources.execution}`);
+    assert.equal(await anonymous.text(), "");
+
+    for (const target of [path, `/open/executions/${randomUUID()}`]) {
+      const denied = await hub.openExecution(outsider.request(target));
+      assert.equal(denied.status, 404);
+      assert.equal(denied.headers.get("cache-control"), "no-store");
+      assert.equal(await denied.text(), "Not Found");
+    }
+
+    assert.equal((await hub.openExecution(owner.request(path))).status, 404);
+    await hub.attachAgent(resources, "agent/launcher");
+    const allowed = await hub.openExecution(owner.request(path));
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.headers.get("cache-control"), "no-store");
+    const page = await allowed.text();
+    assert.match(page, /href="paseo:\/\/h\/server-launcher\/agent\/agent%2Flauncher"/u);
+    assert.match(page, /href=".*[?]view=run"/u);
+    // An execution no trigger run started lands on the organization's Activity.
+    const run = await hub.openExecution(owner.request(`${path}?view=run`));
+    assert.equal(run.status, 303);
+    assert.match(run.headers.get("location") ?? "", /^\/o\/private-studio[\w-]*\/activity$/u);
   });
 
   it("requires an explicit valid active membership and fails closed when it goes stale", async () => {
@@ -166,22 +202,25 @@ describe("account and organization boundary", () => {
     await hub.assertCliCredential(credential, "authorized");
   });
 
-  for (const role of ["member", "admin"] as const) {
-    it(`binds an unbound GitHub organization installation only for its active admin (${role})`, async () => {
+  // `mona` is a plain member of acme-inc on GitHub; `octo` is its admin.
+  for (const login of ["mona", "octo"] as const) {
+    it(`binds an installed GitHub organization only for its active admin (${login})`, async () => {
       const hub = await startAccounts(postgres);
       const owner = await hub.signUp("Alice", "alice@example.com");
       const organizationId = await owner.createOrganization("Acme");
-      const github = new GitHubProviderPort({
-        installation: githubInstallation(142),
-        membership: { role, state: "active" },
+      const github = new FakeGitHub({
+        webBaseUrl: "https://github.test",
+        hubOrigin: () => "http://localhost:3000",
       });
+      github.command({ op: "install", account: "acme-inc" });
+      github.command({ op: "signIn", login });
       const connection = await hub.githubConnection(github);
-      const result = await owner.connectGitHub(connection);
-      const bound = await hub.githubInstallationOrganization(142);
-      assert.equal(bound, role === "admin" ? organizationId : undefined);
+      const result = await owner.chooseGitHubInstallation(connection, github, 42);
+      const bound = await hub.githubInstallationOrganization(42);
+      assert.equal(bound, login === "octo" ? organizationId : undefined);
       assert.equal(
         new URL(result.headers.get("location")!).searchParams.get("result"),
-        role === "admin" ? "github_connected" : "connection_invalid",
+        login === "octo" ? "github_connected" : "github_not_owner",
       );
     });
   }
@@ -566,7 +605,7 @@ class PaseoAccounts {
     );
   }
 
-  async githubConnection(github: GitHubProviderPort): Promise<ProviderConnectionRegistration> {
+  async githubConnection(github: FakeGitHub): Promise<ProviderConnectionRegistration> {
     await this.query(
       `insert into runtime_provider_activation (provider, provider_application_id, configuration_version)
        values ('github', '42', 0)`,
@@ -583,8 +622,8 @@ class PaseoAccounts {
         clientSecret: "secret",
         privateKey: "test-key",
       },
-      appAuth: github,
-      fetch: github.options().fetch,
+      appAuth: github.appAuth,
+      connectionClient: fakeGitHubConnectionClient(github, "http://localhost:3000"),
       configurationProvider: {
         listInstallationRepositories: () => Promise.resolve([]),
         readDefaultBranchHead: () => Promise.reject(new Error("unused")),
@@ -742,6 +781,17 @@ class PaseoAccounts {
     );
   }
 
+  openExecution(request: Request): Promise<Response> {
+    return createExecutionLauncher(this.database, this.auth)(
+      request,
+      new URL(request.url).pathname.split("/").at(-1)!,
+    );
+  }
+
+  async attachAgent(ids: ResourceIds, agentId: string): Promise<void> {
+    await this.database.attachAgentToExecution(ids.execution, ids.daemon, agentId);
+  }
+
   async seedResources(organizationId: string, suffix: string): Promise<ResourceIds> {
     const projectId = randomUUID();
     await this.query(
@@ -846,9 +896,17 @@ class AccountBrowser {
     this.rememberCookie(response);
   }
 
-  async connectGitHub(connection: ProviderConnectionRegistration): Promise<Response> {
-    const request = (path: string, method = "GET") =>
-      new Request(new URL(path, "http://localhost:3000"), {
+  /**
+   * Starts a GitHub connection, authorizes on GitHub, and asks the chooser to connect one
+   * installation, whether or not the chooser offered it. Returns the chooser's answer.
+   */
+  async chooseGitHubInstallation(
+    connection: ProviderConnectionRegistration,
+    github: FakeGitHub,
+    installationId: number,
+  ): Promise<Response> {
+    const request = (url: string | URL, method = "GET") =>
+      new Request(new URL(url, "http://localhost:3000"), {
         method,
         headers: { cookie: this.cookie, origin: "http://localhost:3000" },
       });
@@ -859,18 +917,17 @@ class AccountBrowser {
       ),
     );
     assert.equal(start.status, 200);
-    const setupUrl = new URL(z.object({ url: z.string() }).parse(await start.json()).url);
-    const setup = await connection.actions["setup"]!(
-      request(
-        `/api/integrations/github/setup?state=${setupUrl.searchParams.get("state")}&installation_id=142&setup_action=install`,
-      ),
+    const authorization = z.object({ url: z.string() }).parse(await start.json()).url;
+    const callback = await connection.actions["callback"]!(
+      request(github.authorize(authorization)),
     );
-    assert.equal(setup.status, 303);
-    const authorization = new URL(setup.headers.get("location")!);
-    assert.equal(authorization.pathname, "/login/oauth/authorize");
-    return connection.actions["callback"]!(
+    assert.equal(callback.status, 303);
+    const chooser = new URL(callback.headers.get("location")!);
+    assert.equal(chooser.pathname, "/integrations/github");
+    return connection.actions["choose"]!(
       request(
-        `/api/integrations/github/callback?state=${authorization.searchParams.get("state")}&code=code`,
+        `/api/integrations/github/choose?state=${chooser.searchParams.get("state")}&installationId=${installationId}`,
+        "POST",
       ),
     );
   }
@@ -1095,7 +1152,7 @@ class AccountBrowser {
       .join("; ");
   }
 
-  private request(path: string): Request {
+  request(path: string): Request {
     return new Request(`http://localhost:3000${path}`, {
       headers: this.cookie.length === 0 ? {} : { cookie: this.cookie },
     });

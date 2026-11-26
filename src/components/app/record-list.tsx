@@ -29,13 +29,16 @@ export function RecordRow({
   children: ReactNode;
   /** Its state, always a `StatusPill`. */
   status?: ReactNode;
-  /** Its actions, always behind a `RowActions` kebab. */
+  /**
+   * Its actions: a `RowActions` kebab for managing the record, or a single button when acting on
+   * it is why the list is shown, as when picking which account to connect.
+   */
   actions?: ReactNode;
 }) {
   return (
     <li className="flex min-w-0 items-center justify-between gap-3 py-3 first:pt-0 last:pb-0">
       <div className="min-w-0">{children}</div>
-      <div className="flex shrink-0 items-center gap-2">
+      <div className="flex shrink-0 items-center gap-3">
         {status}
         {actions}
       </div>

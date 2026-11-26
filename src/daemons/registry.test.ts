@@ -18,6 +18,85 @@ function rawDataToText(data: RawData): string {
   return data.toString();
 }
 
+function daemonRecord(secret: string): DaemonRecord {
+  const now = new Date();
+  return {
+    id: randomUUID(),
+    slug: "negotiation-daemon",
+    machineId: randomUUID(),
+    serverId: randomUUID(),
+    daemonPublicKey: "public-key",
+    credentialVerifier: createHash("sha256").update(secret).digest("base64url"),
+    permissions: ["hub.execute"],
+    registeredByApiKeyId: null,
+    registeredByCliCredentialId: null,
+    status: "active",
+    presence: "offline",
+    connectedAt: null,
+    disconnectedAt: null,
+    lastSeenAt: now,
+    createdAt: now,
+  };
+}
+
+describe("daemon socket admission during shutdown", () => {
+  it("refuses a daemon whose credential lookup finishes after shutdown begins", async () => {
+    const secret = "daemon-secret";
+    const daemon = daemonRecord(secret);
+    const presence: string[] = [];
+    const registry = new ActiveDaemonRegistry({
+      touchDaemon: async () => undefined,
+      setDaemonPresence: async (_id, value) => {
+        presence.push(value);
+      },
+    });
+    let lookupStarted!: () => void;
+    const lookingUp = new Promise<void>((resolve) => (lookupStarted = resolve));
+    let finishLookup!: () => void;
+    const lookup = new Promise<void>((resolve) => (finishLookup = resolve));
+    const handleUpgrade = createDaemonUpgradeHandler(
+      {
+        findDaemonById: async () => {
+          lookupStarted();
+          await lookup;
+          return daemon;
+        },
+      },
+      registry,
+    );
+    const server = createServer();
+    server.on("upgrade", (request, socket, head) => {
+      void handleUpgrade(request, socket, head);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert(address && typeof address !== "string");
+    const client = new WebSocket(`ws://127.0.0.1:${address.port}/api/daemons/socket`, {
+      headers: { authorization: `Bearer ${secret}`, "x-paseo-daemon-id": daemon.id },
+    });
+    const outcome = new Promise<string>((resolve) => {
+      client.once("open", () => resolve("open"));
+      client.once("unexpected-response", (_request, response) =>
+        resolve(`rejected ${response.statusCode}`),
+      );
+      client.once("error", (error) => resolve(`error ${error.message}`));
+    });
+    await lookingUp;
+
+    await registry.stop();
+    finishLookup();
+
+    try {
+      assert.equal(await outcome, "rejected 503");
+      assert.equal(registry.connection(daemon.id), undefined);
+      assert.deepEqual(presence, []);
+    } finally {
+      client.terminate();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
 describe("daemon socket protocol negotiation", () => {
   it.each([
     {
@@ -36,24 +115,7 @@ describe("daemon socket protocol negotiation", () => {
     "negotiates the standard session only when offered=$offered",
     async ({ offered, expectedProtocol, expectsHello, expectsReady }) => {
       const secret = "daemon-secret";
-      const now = new Date();
-      const daemon: DaemonRecord = {
-        id: randomUUID(),
-        slug: "negotiation-daemon",
-        machineId: randomUUID(),
-        serverId: randomUUID(),
-        daemonPublicKey: "public-key",
-        credentialVerifier: createHash("sha256").update(secret).digest("base64url"),
-        permissions: ["hub.execute"],
-        registeredByApiKeyId: null,
-        registeredByCliCredentialId: null,
-        status: "active",
-        presence: "offline",
-        connectedAt: null,
-        disconnectedAt: null,
-        lastSeenAt: now,
-        createdAt: now,
-      };
+      const daemon = daemonRecord(secret);
       const registry = new ActiveDaemonRegistry({
         touchDaemon: async () => undefined,
         setDaemonPresence: async () => undefined,
@@ -88,13 +150,17 @@ describe("daemon socket protocol negotiation", () => {
         client.once("open", resolve);
         client.once("error", reject);
       });
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      const isHello = (message: string) =>
+        HubDaemonHelloSchema.safeParse(JSON.parse(message)).success;
+      if (expectsHello) {
+        // The hello crosses the socket after the client's open event, so wait for it to arrive.
+        await vi.waitFor(() => assert(messages.some(isHello)), { timeout: 5_000 });
+      } else {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
 
       assert.equal(negotiatedProtocol, expectedProtocol);
-      assert.equal(
-        messages.some((message) => HubDaemonHelloSchema.safeParse(JSON.parse(message)).success),
-        expectsHello,
-      );
+      assert.equal(messages.some(isHello), expectsHello);
       assert.equal(registry.connection(daemon.id) !== undefined, expectsReady);
 
       client.close();
@@ -158,7 +224,7 @@ describe("daemon socket generations", () => {
     });
   });
 
-  it("forwards only structured MCP grants with opaque provider options", async () => {
+  it("forwards opaque provider options without a Hub tool policy", async () => {
     const pending = await daemon.pendingCreate("contract-create");
 
     assert.deepEqual(
@@ -169,15 +235,15 @@ describe("daemon socket generations", () => {
     );
     assert.deepEqual(
       z.record(z.string(), z.unknown()).parse(pending.request["config"])["toolPolicy"],
-      {
-        preapproved: [{ kind: "mcp", server: "hub", tool: "finish_execution" }],
-      },
+      undefined,
     );
   });
 
   it("delegates provider, model, mode, and structured option validation to the daemon", async () => {
-    const pending = await daemon.pendingAgentValidation();
+    const pending = await daemon.pendingAgentValidation("/workspace");
 
+    // The daemon resolves the provider catalog of the directory the agent will run in (#209).
+    assert.equal(pending.request["cwd"], "/workspace");
     assert.equal(pending.request["provider"], "definitely-not-installed");
     assert.equal(pending.request["model"], "imaginary-model");
     assert.equal(pending.request["modeId"], "imaginary-mode");
@@ -226,6 +292,85 @@ describe("daemon socket generations", () => {
     ]);
   });
 
+  it("lists the projects the daemon has open", async () => {
+    const projects = await daemon.pendingProjectList();
+    daemon.respondProjectList(projects, [
+      {
+        projectId: "project-1",
+        projectDisplayName: "hub",
+        projectCustomName: "Paseo Hub",
+        projectRootPath: "/home/dev/hub",
+        projectKind: "git",
+      },
+      {
+        projectId: "project-2",
+        projectDisplayName: "notes",
+        projectCustomName: null,
+        projectRootPath: "/home/dev/notes",
+        projectKind: "a-kind-added-later",
+      },
+    ]);
+
+    assert.deepEqual(await projects.promise, [
+      { id: "project-1", name: "Paseo Hub", rootPath: "/home/dev/hub" },
+      { id: "project-2", name: "notes", rootPath: "/home/dev/notes" },
+    ]);
+  });
+
+  it.each(["access_denied", "unknown_schema"])(
+    "reads a daemon that answers the project list with %s as offering no projects",
+    async (code) => {
+      const projects = await daemon.pendingProjectList();
+      daemon.rejectRequest(projects, code);
+
+      assert.deepEqual(await projects.promise, []);
+    },
+  );
+
+  it("still fails the project list when the daemon breaks while answering it", async () => {
+    const projects = await daemon.pendingProjectList();
+    daemon.rejectRequest(projects, "handler_error");
+
+    await assert.rejects(projects.promise, /daemon refused/u);
+  });
+
+  it("asks a legacy daemon for nothing and offers no projects", async () => {
+    await daemon.replaceConnection(false, "legacy");
+
+    assert.deepEqual(await daemon.listProjects(), []);
+  });
+
+  it("expires unanswered project list requests without interrupting slow provider refreshes", async () => {
+    const timed = await DaemonRegistryHarness.start(createLogger(stream), 50);
+    try {
+      const refresh = await timed.pendingProviderRefresh();
+      const unanswered = await timed.pendingProjectList();
+
+      await assert.rejects(unanswered.promise, /daemon_request_timeout/u);
+
+      // Provider discovery can run much longer than project suggestions; the refresh still settles.
+      assert.equal(await timed.requestSettled(refresh.promise), false);
+      timed.respondProviderRefresh(refresh);
+      await refresh.promise;
+
+      const answered = await timed.pendingProjectList();
+      timed.respondProjectList(answered, [
+        {
+          projectId: "project-1",
+          projectDisplayName: "hub",
+          projectCustomName: null,
+          projectRootPath: "/home/dev/hub",
+          projectKind: "git",
+        },
+      ]);
+      assert.deepEqual(await answered.promise, [
+        { id: "project-1", name: "hub", rootPath: "/home/dev/hub" },
+      ]);
+    } finally {
+      await timed.stop();
+    }
+  });
+
   it("waits for offline presence before shutdown completes", async () => {
     daemon.holdOfflinePresence();
 
@@ -235,6 +380,16 @@ describe("daemon socket generations", () => {
     assert.equal(await daemon.shutdownCompleted(), false);
     daemon.persistOfflinePresence();
     await daemon.shutdownCompletes();
+  });
+
+  it("finishes shutdown when a daemon never answers the close frame", async () => {
+    daemon.ignoreCloseHandshake();
+    const started = Date.now();
+
+    await daemon.stop();
+
+    // `ws` alone waits 30 seconds for the close handshake; supervisors kill Hub before that.
+    assert.ok(Date.now() - started < 3_000, `shutdown took ${Date.now() - started}ms`);
   });
 
   it("logs an offline-presence storage rejection exactly once", async () => {

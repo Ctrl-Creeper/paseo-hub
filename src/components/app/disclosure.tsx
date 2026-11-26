@@ -2,6 +2,7 @@ import { ChevronDown } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { cn } from "../../lib/utils.js";
+import { CardFooter, type SurfaceFooter } from "./card.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../ui/collapsible.js";
 
 /**
@@ -21,6 +22,7 @@ export function Disclosure({
   title,
   description,
   status,
+  footer,
   children,
 }: {
   id: string;
@@ -30,8 +32,13 @@ export function Disclosure({
   media?: ReactNode;
   title: string;
   description?: string;
-  /** The single status indicator, rendered before the chevron. */
+  /**
+   * The single status indicator, rendered before the chevron: a `StatusPill` for state, or plain
+   * text for a count, which reads as muted context.
+   */
   status?: ReactNode;
+  /** The same closing line a `Card` has, inside the body, so it folds away with it. */
+  footer?: SurfaceFooter;
   children: ReactNode;
 }) {
   const headerId = `${id}-header`;
@@ -82,7 +89,10 @@ export function Disclosure({
         </span>
         <span className="contents sm:flex sm:shrink-0 sm:items-center sm:gap-2">
           <span
-            className={cn("row-start-3 justify-self-start sm:col-auto sm:row-auto", compact.full)}
+            className={cn(
+              "row-start-3 justify-self-start text-sm text-muted-foreground tabular-nums sm:col-auto sm:row-auto",
+              compact.full,
+            )}
           >
             {status}
           </span>
@@ -106,7 +116,14 @@ export function Disclosure({
         aria-labelledby={headerId}
         className="min-w-0 overflow-hidden border-t px-4 py-4 data-[state=closed]:hidden"
       >
-        {children}
+        {footer === undefined ? (
+          children
+        ) : (
+          <div className="grid min-w-0 gap-4">
+            {children}
+            <CardFooter {...footer} />
+          </div>
+        )}
       </CollapsibleContent>
     </Collapsible>
   );

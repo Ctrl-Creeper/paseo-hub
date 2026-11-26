@@ -56,6 +56,14 @@ test("an operator caps seats, a blocked invite explains itself, and the audit tr
     await page.screenshot({ path: `${SLICE_2_DIR}/01-operator-console.png`, fullPage: true });
   });
 
+  await test.step("find the organization by its ID and confirm it by its members", async () => {
+    await hub.expectOperatorFindsOrganizationById("owner", {
+      org: "Acme",
+      member: { name: owner.name, email: owner.email, role: "Owner" },
+    });
+    await page.screenshot({ path: `${SLICE_2_DIR}/01b-operator-members.png`, fullPage: true });
+  });
+
   await test.step("cap seats at 2 from the operator console with a required reason", async () => {
     await hub.openSeatOverrideEditor("owner", { org: "Acme", max: 2, reason });
     await page.screenshot({ path: `${SLICE_2_DIR}/02-override-editor.png`, fullPage: true });
@@ -106,6 +114,7 @@ test.describe("metered usage", () => {
 
     await test.step("install a manual deploy trigger against the registered daemon", async () => {
       await app.navigation.leaveInstance();
+      await triggers.open();
       await triggers.startNew();
       await triggers.configureManual({
         name: "deploy",
@@ -145,11 +154,10 @@ test.describe("metered usage", () => {
     await test.step("the denied run fails in organization activity", async () => {
       await app.navigation.openOrganizationSection("Activity");
       const deployRows = page
-        .getByRole("table", { name: "Trigger activity" })
+        .getByRole("table", { name: "Runs" })
         .getByRole("row")
         .filter({ has: page.getByRole("cell", { name: "deploy", exact: true }) });
-      // Organization activity is intentionally compact and has no legacy run-detail route. The
-      // durable-engine suite retains the exact entitlement-reason assertion.
+      // The durable-engine suite retains the exact entitlement-reason assertion.
       await expect(async () => {
         await page.reload();
         await expect(deployRows).toHaveCount(2);

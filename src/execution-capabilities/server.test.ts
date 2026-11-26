@@ -7,9 +7,12 @@ import {
   type ServerResponse,
 } from "node:http";
 import { Ajv } from "ajv";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import {
+  Client,
+  StreamableHTTPClientTransport,
+  type VersionNegotiationMode,
+} from "@modelcontextprotocol/client";
+import { Server as McpProtocolServer } from "@modelcontextprotocol/server";
 import { describe, it, vi } from "vitest";
 import { z } from "zod";
 import { hashAgentExecutionCompletionToken } from "../agent-executions/completion-token.js";
@@ -18,6 +21,7 @@ import { createMemoryDatabase } from "../db/memory.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { createFetchServer } from "../http/node-server.js";
 import { registerResponseLifecycle, takeResponseLifecycle } from "../http/response-lifecycle.js";
+import { readMcpMessage } from "../test-utils/mcp-response.js";
 import { OutputExecutorRegistry, replyOutputTool, type OutputCapability } from "./outputs.js";
 import { createExecutionCapabilityServer } from "./server.js";
 
@@ -70,7 +74,7 @@ describe("execution capability MCP boundary", () => {
       request: () => JSON.stringify({ jsonrpc: "1.0", id: 1, method: "ping" }),
       token: "token",
       expectedStatus: 400,
-      expectedCode: -32700,
+      expectedCode: -32600,
     },
     {
       name: "unsupported method",
@@ -131,7 +135,7 @@ describe("execution capability MCP boundary", () => {
 
     assert.equal(response.status, testCase.expectedStatus);
     if (testCase.expectedCode !== undefined || testCase.expectedToolError === true) {
-      const body = RpcResponseSchema.parse(await response.json());
+      const body = RpcResponseSchema.parse(await readMcpMessage(response));
       if (testCase.expectedCode !== undefined)
         assert.equal(body.error?.code, testCase.expectedCode);
       if (testCase.expectedToolError === true) {
@@ -140,32 +144,77 @@ describe("execution capability MCP boundary", () => {
     }
   });
 
-  it("interoperates with the official MCP client for discovery and completion", async () => {
-    const fixture = await capabilityFixture();
-    const endpoint = await serveFixture(fixture);
-    const client = new Client({ name: "paseo-hub-test", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(new URL(endpoint.url), {
-      requestInit: { headers: { authorization: "Bearer token" } },
-    });
-    try {
-      // The SDK's getter is typed `string | undefined` while its Transport interface uses an
-      // exact-optional `sessionId?: string`; the runtime class is the SDK's official transport.
-      // @ts-expect-error upstream SDK exactOptionalPropertyTypes mismatch
-      await client.connect(transport);
-      assert.deepEqual(
-        (await client.listTools()).tools.map((tool) => tool.name),
-        ["finish_execution", "reply"],
+  // Claude Code and other current MCP clients speak protocol revision
+  // 2026-07-28 first and fall back to a 2025 `initialize` handshake only after
+  // the server rejects it, which delayed every Slack-triggered run (#176).
+  it.each([
+    { client: "pinned", mode: { pin: "2026-07-28" }, negotiated: "2026-07-28" },
+    { client: "auto-negotiating", mode: "auto", negotiated: "2026-07-28" },
+    { client: "legacy", mode: "legacy", negotiated: "2025-11-25" },
+  ] satisfies { client: string; mode: VersionNegotiationMode; negotiated: string }[])(
+    "serves discovery and completion to a $client client over protocol $negotiated",
+    async ({ mode, negotiated }) => {
+      const fixture = await capabilityFixture();
+      const endpoint = await serveFixture(fixture);
+      const client = new Client(
+        { name: "paseo-hub-test", version: "1.0.0" },
+        { versionNegotiation: { mode } },
       );
-      const result = await client.callTool({
-        name: "finish_execution",
-        arguments: {},
-      });
-      assert.equal(result.isError, undefined);
-      assert.deepEqual(fixture.completions, [{ executionId: fixture.executionId, token: "token" }]);
-    } finally {
-      await client.close();
-      await closeServer(endpoint.server);
-    }
+      try {
+        await client.connect(
+          new StreamableHTTPClientTransport(new URL(endpoint.url), {
+            requestInit: { headers: { authorization: "Bearer token" } },
+          }),
+        );
+        assert.equal(client.getNegotiatedProtocolVersion(), negotiated);
+        assert.deepEqual(
+          (await client.listTools()).tools.map((tool) => tool.name),
+          ["finish_execution", "reply"],
+        );
+        const result = await client.callTool({ name: "finish_execution", arguments: {} });
+        assert.equal(result.isError, undefined);
+        assert.deepEqual(fixture.completions, [
+          { executionId: fixture.executionId, token: "token" },
+        ]);
+      } finally {
+        await client.close();
+        await closeServer(endpoint.server);
+      }
+    },
+  );
+
+  it("advertises only granted integration actions beside existing Hub tools", async () => {
+    const fixture = await capabilityFixture(
+      undefined,
+      "succeeded",
+      1,
+      undefined,
+      false,
+      [],
+      replyOutputTool,
+      [],
+      {
+        slack: { connection: "workspace-slack", actions: ["post"], channels: ["CALLOWED"] },
+        discord: { connection: "community-discord", actions: ["read"], channels: ["123"] },
+      },
+    );
+    const response = await fixture.call("tools/list");
+    assert.deepEqual(
+      ToolsListSchema.parse(response.result).tools.map(({ name }) => name),
+      [
+        "finish_execution",
+        "reply",
+        "slack_post",
+        "discord_list_channels",
+        "discord_read",
+        "discord_latest",
+      ],
+    );
+    const denied = await fixture.call("tools/call", {
+      name: "discord_post",
+      arguments: { target: "123", content: "hello" },
+    });
+    assert.equal(ToolResultSchema.parse(denied.result).isError, true);
   });
 
   it("allows an event-native reply to be sent repeatedly without a synthetic cap", async () => {
@@ -199,7 +248,6 @@ describe("execution capability MCP boundary", () => {
       requestInit: { headers: { authorization: "Bearer token" } },
     });
     try {
-      // @ts-expect-error upstream SDK exactOptionalPropertyTypes mismatch
       await client.connect(transport);
       const exposedTools = await client.listTools();
       assert.deepEqual(
@@ -282,22 +330,22 @@ describe("execution capability MCP boundary", () => {
     }
   });
 
-  it("closes MCP transport on response abort while leaving the archive pending", async () => {
+  it("closes the MCP server on response abort while leaving the archive pending", async () => {
     const fixture = await capabilityFixture(undefined, "succeeded", 1, undefined, true);
     let releaseBody!: () => void;
     const bodyRelease = new Promise<void>((resolve) => {
       releaseBody = resolve;
     });
     let closeObserved!: () => void;
-    const transportClosed = new Promise<void>((resolve) => {
+    const mcpServerClosed = new Promise<void>((resolve) => {
       closeObserved = resolve;
     });
-    const closeTransport = WebStandardStreamableHTTPServerTransport.prototype["close"];
+    const closeMcpServer = McpProtocolServer.prototype["close"];
     const closeSpy = vi
-      .spyOn(WebStandardStreamableHTTPServerTransport.prototype, "close")
-      .mockImplementation(async function (this: WebStandardStreamableHTTPServerTransport) {
+      .spyOn(McpProtocolServer.prototype, "close")
+      .mockImplementation(async function (this: McpProtocolServer) {
         closeObserved();
-        await closeTransport.call(this);
+        await closeMcpServer.call(this);
       });
     const server = createFetchServer(async (request) => {
       const response = await fixture.server.handle(request, fixture.executionId);
@@ -341,7 +389,7 @@ describe("execution capability MCP boundary", () => {
         body: mcpRequest("tools/call", { name: "finish_execution", arguments: {} }),
         onFirstData: releaseBody,
       });
-      await transportClosed;
+      await mcpServerClosed;
       const execution = await fixture.database.findAgentExecutionById(fixture.executionId);
       assert.equal(execution?.status, "succeeded");
       assert.equal(execution?.hubAction, "archive");
@@ -661,6 +709,24 @@ describe("execution capability MCP boundary", () => {
     assert.equal(typeof fixture.outbound[0]?.attemptId, "string");
   });
 
+  it("gives the reply executor a shareable link once the daemon agent is attached", async () => {
+    const fixture = await capabilityFixture(undefined, "succeeded", 2);
+    const reply = () =>
+      fixture.call("tools/call", {
+        name: "reply",
+        arguments: { content: "Ready" },
+      });
+
+    assert.equal(ToolResultSchema.parse((await reply()).result).isError, undefined);
+    assert.equal(fixture.outbound[0]?.openInPaseoUrl, undefined);
+    await fixture.database.attachAgentToExecution(fixture.executionId, randomUUID(), "agent");
+    assert.equal(ToolResultSchema.parse((await reply()).result).isError, undefined);
+    assert.equal(
+      fixture.outbound[1]?.openInPaseoUrl,
+      `https://hub.test/open/executions/${fixture.executionId}`,
+    );
+  });
+
   it("allows replies up to the configured maximum", async () => {
     const fixture = await capabilityFixture(() => Promise.resolve(), "succeeded", 3);
 
@@ -736,11 +802,15 @@ async function capabilityFixture(
   requiredOutputTypes: readonly string[] = [],
   outputTool = replyOutputTool,
   additionalCapabilities: readonly OutputCapability[] = [],
+  tools?: LaunchMachineIntent["tools"],
 ) {
   const database = createMemoryDatabase();
   const executionId = randomUUID();
   const token = "token";
-  const intent = launchIntent(maxReplies, outputSchema, autoArchive, requiredOutputTypes);
+  const intent = {
+    ...launchIntent(maxReplies, outputSchema, autoArchive, requiredOutputTypes),
+    ...(tools === undefined ? {} : { tools }),
+  };
   await database.insertAgentExecution({
     id: executionId,
     organizationId: "org-1",
@@ -770,6 +840,7 @@ async function capabilityFixture(
   }> = [];
   const server = createExecutionCapabilityServer({
     database,
+    publicBaseUrl: "https://hub.test",
     outputs,
     async completeExecution(input) {
       completions.push(input);
@@ -805,7 +876,7 @@ async function capabilityFixture(
         }),
         executionId,
       );
-      return RpcResponseSchema.parse(await response.json());
+      return RpcResponseSchema.parse(await readMcpMessage(response));
     },
   };
 }

@@ -14,6 +14,7 @@ import { SourcePaseo } from "./helpers/source-paseo.js";
 import type { BrowserDiscordEvent } from "../src/e2e/harness/browser-providers.js";
 import type { BrowserProviderScenario } from "../src/e2e/harness/browser-providers.js";
 import type { FixtureBillingProduct } from "../src/e2e/harness/browser-billing.js";
+import type { FakeGitHubCommand } from "../src/test-utils/fake-github.js";
 import { ProjectExternalFacts } from "./helpers/projects/external.js";
 
 const billingInspectSchema = z.object({ reportedSeatQuantity: z.number().nullable() });
@@ -131,6 +132,8 @@ class BuiltApplications {
         commitSha: string;
         files?: readonly { path: string; content: string }[];
       }) => deliverCommand(server, { type: "github-configuration", ...input }),
+      github: (command: FakeGitHubCommand) =>
+        deliverCommand(server, { type: "fake-github", command }),
       setBillingProduct: (product: FixtureBillingProduct) =>
         deliverCommand(server, { type: "billing-product", product }),
       cancelSubscription: (organizationId: string) =>
@@ -233,10 +236,10 @@ interface ApplicationEnvironmentInput {
   browserAuth?: boolean;
   machineAuth?: boolean;
   providerConnections?: boolean;
-  githubApprovalRequired?: boolean;
   providerScenario?: BrowserProviderScenario;
   providerApplications?: boolean;
   environmentApps?: readonly ("github" | "slack" | "discord" | "linear")[];
+  socialSignIn?: BuiltApplicationOptions["socialSignIn"];
   machineKeyFile: string;
   databaseProfile?: BuiltApplicationOptions["databaseProfile"];
   bootstrap?: BuiltApplicationOptions["bootstrap"];
@@ -268,11 +271,7 @@ function applicationEnvironment(input: ApplicationEnvironmentInput): NodeJS.Proc
     PASEO_BROWSER_BILLING_SCENARIO: input.billing === true ? "configured" : "unconfigured",
     PASEO_BROWSER_PROVIDER_SCENARIO:
       input.providerScenario ??
-      (input.providerConnections === false
-        ? "not-configured"
-        : input.githubApprovalRequired === true
-          ? "approval"
-          : "connected"),
+      (input.providerConnections === false ? "not-configured" : "connected"),
     PASEO_BROWSER_PROVIDER_APPS: input.providerApplications === true ? "dynamic" : "static",
     ...(input.reverseProxy === true
       ? { PASEO_HUB_TRUSTED_CLIENT_IP_HEADER: "x-paseo-e2e-client-ip" }
@@ -281,6 +280,14 @@ function applicationEnvironment(input: ApplicationEnvironmentInput): NodeJS.Proc
       ? {}
       : { PASEO_E2E_TLS_KEY: input.tls.key, PASEO_E2E_TLS_CERT: input.tls.cert }),
     ...environmentAppVariables(input.environmentApps ?? []),
+    ...(input.socialSignIn === true
+      ? {
+          PASEO_AUTH_GOOGLE_CLIENT_ID: "e2e-google-client",
+          PASEO_AUTH_GOOGLE_CLIENT_SECRET: "e2e-google-secret",
+          PASEO_AUTH_GITHUB_CLIENT_ID: "e2e-github-client",
+          PASEO_AUTH_GITHUB_CLIENT_SECRET: "e2e-github-secret",
+        }
+      : {}),
     ...(input.bootstrap === undefined
       ? {}
       : {

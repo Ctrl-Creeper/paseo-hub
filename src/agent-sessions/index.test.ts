@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { expect, test } from "vitest";
 import { AgentSessions } from "./index.js";
 import { createMemoryDatabase } from "../db/memory.js";
@@ -7,12 +8,14 @@ import { createExecutionCapabilityServer } from "../execution-capabilities/serve
 import type { AgentConnection, AgentSnapshot } from "../daemons/agents/index.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import type { DaemonCreateAgentOptions } from "../daemons/protocol.js";
+import { readMcpMessage } from "../test-utils/mcp-response.js";
 
 class TestAgents implements AgentConnection {
   readonly agents = new Map<string, AgentSnapshot>();
   readonly deliveries: { agentId: string; text: string }[] = [];
   readonly creates: DaemonCreateAgentOptions[] = [];
   readonly messages = new Set<string>();
+  loseNextGet = false;
   archives = 0;
   restorations = 0;
   async create(_key: string, options: DaemonCreateAgentOptions) {
@@ -22,6 +25,10 @@ class TestAgents implements AgentConnection {
     return agent;
   }
   async get(id: string) {
+    if (this.loseNextGet) {
+      this.loseNextGet = false;
+      throw new Error("response lost");
+    }
     const agent = this.agents.get(id);
     if (!agent) throw new Error("missing");
     return agent;
@@ -30,6 +37,12 @@ class TestAgents implements AgentConnection {
     if (this.messages.has(messageId)) return;
     this.messages.add(messageId);
     this.deliveries.push({ agentId, text });
+    // The daemon resumes a stored agent from persistence when it receives a message.
+    this.agents.set(agentId, { ...(await this.get(agentId)), status: "running" });
+  }
+  /** Idle runtime cleanup and daemon shutdown keep the agent in storage as closed, not archived. */
+  async closeAgent(agentId: string) {
+    this.agents.set(agentId, { ...(await this.get(agentId)), status: "closed" });
   }
   async watch() {
     return () => {};
@@ -123,7 +136,6 @@ async function fixture(now = Date.now) {
             provider: "codex",
             cwd: "/repo",
             env: intent.github === undefined ? {} : { GH_TOKEN: "scoped-github-token" },
-            toolPolicy: { preapproved: [] },
           }),
         }),
     };
@@ -159,11 +171,49 @@ async function fixture(now = Date.now) {
       }),
       session!.id,
     );
-    const result: unknown = await response.json();
-    return result;
+    return readMcpMessage(response);
   }
-  return { database, connection, sessions, replies, arrival, execution, call };
+  async function sessionMcp(executionId: string) {
+    const owner = await execution(executionId);
+    const session = await database.findAgentSession(owner.agentSessionId!);
+    return {
+      sessionId: session!.id,
+      mcp: session!.creationOptions.mcpServers!["hub"]!,
+      handle: (request: Request) => capabilities.handleSession(request, session!.id),
+    };
+  }
+  return { database, connection, sessions, replies, arrival, execution, call, sessionMcp };
 }
+
+test("continuations reuse matching integration grants and reject a different scope", async () => {
+  const f = await fixture();
+  const arrival = (channel: string) =>
+    f.arrival("conversation", "daemon", {}, "reply", {
+      tools: { slack: { connection: "workspace-slack", actions: ["post"], channels: [channel] } },
+    });
+  const first = await arrival("CALLOWED");
+  const followUp = await arrival("CALLOWED");
+  const differentChannel = await arrival("COTHER");
+
+  const agent = await first.dispatch();
+  expect((await followUp.dispatch()).agentId).toBe(agent.agentId);
+  await expect(differentChannel.dispatch()).rejects.toThrow("Continuation settings differ");
+  expect(f.connection.deliveries).toHaveLength(2);
+  expect(f.connection.deliveries.map(({ text }) => text)).toEqual([
+    expect.stringContaining(`https://hub.test/open/executions/${first.executionId}`),
+    expect.stringContaining(`https://hub.test/open/executions/${followUp.executionId}`),
+  ]);
+});
+
+test("a fresh agent with read-only integration tools gets the authored prompt verbatim", async () => {
+  const f = await fixture();
+  const prompt = "Read the latest update.";
+  const run = await f.arrival(false, "daemon", {}, prompt, {
+    tools: { slack: { connection: "workspace-slack", actions: ["read"], channels: ["CALLOWED"] } },
+  });
+  await run.dispatch();
+  expect(f.connection.deliveries.map(({ text }) => text)).toEqual([prompt]);
+});
 
 test("same-key arrivals share an agent; an earlier completion cannot archive newer work", async () => {
   const f = await fixture();
@@ -182,6 +232,65 @@ test("same-key arrivals share an agent; an earlier completion cannot archive new
   const third = await f.arrival();
   expect(await third.dispatch()).toMatchObject({ agentId: a.agentId, action: "restored" });
   expect(f.connection.restorations).toBe(1);
+});
+
+test("a follow-up resumes a continuation agent the daemon closed while idle", async () => {
+  const f = await fixture();
+  const first = await f.arrival();
+  const original = await first.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  await f.connection.closeAgent(original.agentId);
+
+  const followUp = await f.arrival("conversation", "daemon", {}, "follow-up");
+  expect(await followUp.dispatch()).toMatchObject({
+    agentId: original.agentId,
+    action: "continued",
+  });
+  expect(f.connection.creates).toHaveLength(1);
+  expect(f.connection.deliveries.map(({ text }) => text)).toEqual([
+    expect.stringContaining("hello"),
+    expect.stringContaining("follow-up"),
+  ]);
+});
+
+test("a follow-up recovered before its message was sent still resumes the closed agent", async () => {
+  const f = await fixture();
+  const first = await f.arrival();
+  const original = await first.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  await f.connection.closeAgent(original.agentId);
+
+  const followUp = await f.arrival("conversation", "daemon", {}, "follow-up");
+  f.connection.loseNextGet = true;
+  await expect(followUp.dispatch()).rejects.toThrow("response lost");
+  expect(await followUp.dispatch()).toMatchObject({ agentId: original.agentId });
+  expect(f.connection.deliveries.map(({ text }) => text)).toEqual([
+    expect.stringContaining("hello"),
+    expect.stringContaining("follow-up"),
+  ]);
+});
+
+test("a recovered execution whose new agent closed before its first status is interrupted", async () => {
+  const f = await fixture();
+  const first = await f.arrival();
+  f.connection.loseNextGet = true;
+  await expect(first.dispatch()).rejects.toThrow("response lost");
+  const [agentId] = f.connection.agents.keys();
+  await f.connection.closeAgent(agentId!);
+
+  await expect(first.dispatch()).rejects.toThrow("agent_interrupted");
+  expect(f.connection.deliveries).toHaveLength(0);
+});
+
+test("a recovered execution whose own agent closed is interrupted instead of resent", async () => {
+  const f = await fixture();
+  const first = await f.arrival();
+  const original = await first.dispatch();
+  await f.database.transitionAgentExecution(first.executionId, "running");
+  await f.connection.closeAgent(original.agentId);
+
+  await expect(first.dispatch()).rejects.toThrow("agent_interrupted");
+  expect(f.connection.deliveries).toHaveLength(1);
 });
 
 test("session tools keep each arrival's destination and reject stale or foreign execution IDs", async () => {
@@ -211,6 +320,40 @@ test("session tools keep each arrival's destination and reject stale or foreign 
   expect(
     await f.call(foreign.executionId, "finish_execution", {}, second.executionId),
   ).toMatchObject({ result: { isError: true } });
+});
+
+// The session MCP endpoint is what Claude Code reaches for every Slack-triggered
+// run. Claude Code speaks 2026-07-28 first, and a rejected request there cost
+// 6 to 22 seconds of fallback before the prompt reached the agent (#176).
+test("session tools serve a client pinned to protocol 2026-07-28", async () => {
+  const f = await fixture();
+  const run = await f.arrival();
+  await run.dispatch();
+  const { mcp, handle } = await f.sessionMcp(run.executionId);
+  const client = new Client(
+    { name: "claude-code", version: "1.0.0" },
+    { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+  );
+  try {
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(mcp.url), {
+        requestInit: { headers: mcp.headers ?? {} },
+        fetch: (input, init) => handle(new Request(input, init)),
+      }),
+    );
+    expect(client.getNegotiatedProtocolVersion()).toBe("2026-07-28");
+    expect(
+      await client.callTool({
+        name: "reply",
+        arguments: { content: "hello", executionId: run.executionId },
+      }),
+    ).toMatchObject({ content: [{ type: "text", text: "Output sent" }] });
+  } finally {
+    await client.close();
+  }
+  expect(f.replies).toEqual([
+    { executionId: run.executionId, context: { arrival: run.executionId } },
+  ]);
 });
 
 test("new-agent policy isolates arrivals and incompatible targets fail without replacement", async () => {

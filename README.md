@@ -95,6 +95,16 @@ invitations, signup verification links, and password-reset links through Resend.
 instances require new password accounts to verify their email before sign-in. Without delivery
 configuration, managers retain the existing copy-and-share invitation workflow.
 
+Sign-in with Google or GitHub is optional. Set `PASEO_AUTH_GOOGLE_CLIENT_ID` and
+`PASEO_AUTH_GOOGLE_CLIENT_SECRET`, or `PASEO_AUTH_GITHUB_CLIENT_ID` and
+`PASEO_AUTH_GITHUB_CLIENT_SECRET`, to show that provider's button. Hub refuses to start with only
+half of a pair. Register `<PASEO_HUB_APP_URL>/api/auth/callback/google` or `/github` as the
+callback. GitHub sign-in needs its own OAuth App, separate from the GitHub App that sends repository
+events. New accounts from a provider follow `PASEO_REGISTRATION_MODE`. A provider sign-in links
+to an existing account with the same email only when the provider has verified the address and
+the account has verified it in Hub. Hub accepts Google's verification only for Gmail and Workspace
+addresses.
+
 Then start Hub and PostgreSQL:
 
 ```sh
@@ -108,6 +118,9 @@ paseo hub connect https://hub.example.com
 ```
 
 The image is published as `ghcr.io/getpaseo/hub:latest`.
+
+Before your first Fly deploy, copy `fly.example.toml` to `fly.toml` in your Hub checkout.
+Set `app`, `primary_region`, and `PASEO_HUB_APP_URL` to match your Fly app.
 
 See the [self-hosting guide](https://paseo.sh/docs/hub/self-hosting) for production deployment details.
 For Linear setup and workflows, see the public [Linear app](https://paseo.sh/docs/hub/self-hosting/linear-app) and [Linear triggers](https://paseo.sh/docs/hub/triggers/linear) guides.
@@ -136,6 +149,40 @@ the execution-scoped `finish_execution` tool. Conversational triggers also recei
 event-native `reply` tool for progress and final responses. Provider or machine policy still
 controls every unrelated tool. A read-only provider configuration is defense in depth; Hub output
 authorization remains enforced by the execution MCP server.
+
+### Scoped Slack and Discord tools
+
+Open **Integration tools** in the trigger editor, select an integration, enter channel IDs, and
+choose **Read**, **Post**, or both. The same grants work in any trigger's `run.tools` block in
+`.paseo/triggers/*.yml`:
+
+```yaml
+run:
+  tools:
+    slack:
+      connection: engineering-slack
+      actions: [post]
+      channels: [C012AB3CD]
+    discord:
+      connection: community-discord
+      actions: [read, post]
+      channels: ["123456789012345678"]
+```
+
+Use the integration slug and channel IDs. Edit triggers whose grants use anchors or aliases in
+YAML. Discord thread and forum post access follows the
+allowlist for their parent channel. Use a message URL or provide its channel and message IDs.
+To load older messages, pass the tool's returned pagination value to the next read. When a grant
+changes, use **New agent** or a new continuation
+key for the next run. Hub checks the connection, action, and destination on every call and keeps
+provider credentials on the server.
+
+| Grant        | Hub MCP tools                                                                                                                                                                                                                           |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Slack read   | `slack_list_channels` lists granted IDs. `slack_read` reads channel or thread messages.                                                                                                                                                 |
+| Slack post   | `slack_post` posts to a channel or replies using its starter's `thread_ts`.                                                                                                                                                             |
+| Discord read | `discord_list_channels` lists granted channels and forums. `discord_read` reads an exact ID or URL with thread context and attachment metadata. `discord_latest` scans recent messages, including active and recently archived threads. |
+| Discord post | `discord_post` posts to a channel, replies in a thread, or starts a thread on a channel message.                                                                                                                                        |
 
 ## Your own GitHub account
 

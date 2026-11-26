@@ -96,6 +96,32 @@ it("logs an embedded database startup failure exactly once", async () => {
   });
 });
 
+it("logs why startup is refused when another Hub holds the embedded data directory", async () => {
+  const canary = "held-data-directory-7c19";
+  const dataDirectory = join(root, canary);
+  process.env["PASEO_HUB_DATA_DIR"] = dataDirectory;
+  const holder = await embeddedDatabaseRuntime(dataDirectory);
+  const stream = new FailureLogStream();
+
+  try {
+    await assert.rejects(() =>
+      runWithFailureTracking(() => startProductionRuntime(), createLogger(stream)),
+    );
+  } finally {
+    await holder.runtime.close();
+  }
+
+  const record = assertOneFailure(stream, {
+    operation: "database.startup",
+    component: "database",
+    canary,
+  });
+  assert.match(
+    JSON.stringify(record["err"]),
+    /already in use by another Paseo Hub process\. Embedded mode supports one process per data directory/,
+  );
+});
+
 it("keeps an interactive claim across a restart and then shows ordinary sign-in", async () => {
   delete process.env["PASEO_BOOTSTRAP_ORGANIZATION"];
   delete process.env["PASEO_BOOTSTRAP_OWNER_EMAIL"];
@@ -116,7 +142,11 @@ it("keeps an interactive claim across a restart and then shows ordinary sign-in"
   // still signs the operator in without a temporary-password gate.
   const restarted = await startProductionRuntime();
   const state = await restarted.browserAccount!(new Request(`${APP_URL}/api/auth/paseo/state`));
-  assert.deepEqual(await state.json(), { status: "signedOut", registration: "invite_only" });
+  assert.deepEqual(await state.json(), {
+    status: "signedOut",
+    registration: "invite_only",
+    socialProviders: [],
+  });
   await restarted.signInEmail!(
     { email: operator.email, password: operator.password },
     new Headers({ origin: APP_URL }),

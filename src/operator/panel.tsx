@@ -1,7 +1,8 @@
 import { useSnapshotQuery } from "../queries/index.js";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useMemo, useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
+import { Combobox } from "../components/app/combobox.js";
 import {
   DataCell,
   DataRow,
@@ -15,7 +16,8 @@ import { FormField } from "../components/app/form-field.js";
 import { PageHeader } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
-import { StatusPill } from "../components/app/status-pill.js";
+import { StatusPill, statusLabel } from "../components/app/status-pill.js";
+import { SummaryPanel, type SummaryRow } from "../components/app/summary-panel.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
 import {
@@ -28,7 +30,7 @@ import {
 import { Skeleton } from "../components/ui/skeleton.js";
 import type { EntitlementChangeSource } from "../db/types.js";
 import type { EntitlementPatch, OverrideKey } from "../entitlements/catalog.js";
-import type { OperatorConsole } from "./console.js";
+import type { OperatorConsole, OperatorSubscription } from "./console.js";
 import {
   operatorClearOverride,
   operatorOrganizations,
@@ -46,9 +48,24 @@ type OverrideTarget =
   | { kind: "executionsMonthly"; key: OverrideKey; hasOverride: boolean; limit: number | null };
 
 const PICKER_TITLE = "Organization";
-const PICKER_DESCRIPTION = "Pick an organization to manage its entitlements.";
+const MEMBER_COLUMNS: readonly DataColumn[] = [
+  { header: "Member", fill: true },
+  { header: "Role" },
+  { header: "Joined", align: "end" },
+];
+const MEMBERS_EMPTY = { title: "No members" };
+// The labels every organization has are known before it loads; only their values wait.
+const DETAILS_LOADING: readonly SummaryRow[] = ["Name", "ID", "Slug", "Created"].map((label) => ({
+  label,
+  value: <Skeleton className="h-5 w-32" />,
+}));
+const ROLE_LABELS: Record<Snapshot["members"][number]["role"], string> = {
+  owner: "Owner",
+  admin: "Admin",
+  member: "Member",
+};
 const AUDIT_TITLE = "Audit trail";
-const AUDIT_DESCRIPTION = "Every provisioning, plan stamp, and override, most recent first.";
+const AUDIT_DESCRIPTION = "Provisioning, plan stamps, and overrides, most recent first";
 const ENTITLEMENT_COLUMNS: readonly DataColumn[] = [
   { header: "Entitlement", fill: true },
   { header: "Granted" },
@@ -66,7 +83,7 @@ const AUDIT_COLUMNS: readonly DataColumn[] = [
 ];
 const AUDIT_EMPTY = {
   title: "No changes yet",
-  description: "Provisioning, plan stamps, and overrides appear here.",
+  description: "Provisioning, plan stamps, and overrides appear here",
 };
 const SOURCE_LABELS: Record<EntitlementChangeSource, string> = {
   provisioning: "Provisioning",
@@ -80,7 +97,7 @@ export function OperatorEntitlementsPage() {
     <>
       <PageHeader
         title="Operator"
-        description="View and edit any organization's entitlements. Instance operators only."
+        description="View and edit any organization's entitlements (instance operators only)"
       />
       <OrganizationPicker slug={slug} onSelect={setSlug} />
       {slug !== null && <OperatorOrganization slug={slug} />}
@@ -100,6 +117,17 @@ function OrganizationPicker({
     queryKey: ["operator", "organizations"],
     queryFn: () => load(),
   });
+  const options = useMemo(
+    () =>
+      (query.data ?? []).map((organization) => ({
+        value: organization.slug,
+        label: organization.name,
+        identifier: organization.id,
+        keywords: [organization.name],
+      })),
+    [query.data],
+  );
+  const choose = useCallback((option: { value: string }) => onSelect(option.value), [onSelect]);
 
   if (query.status === "pending") return <OrganizationPickerLoading />;
   if (query.status === "error") {
@@ -107,24 +135,24 @@ function OrganizationPicker({
       <FailureAlert
         title="Operator console unavailable"
         error={query.error}
-        fallback="Hub did not receive the organization list. Check your connection and reload the page."
+        fallback="Hub did not receive the organization list. Check your connection and reload the page"
       />
     );
   }
   return (
-    <Section title={PICKER_TITLE} description={PICKER_DESCRIPTION}>
-      <Select {...(slug === null ? {} : { value: slug })} onValueChange={onSelect}>
-        <SelectTrigger aria-label="Manage organization" className="w-full max-w-sm">
-          <SelectValue placeholder="Select an organization" />
-        </SelectTrigger>
-        <SelectContent>
-          {query.data.map((organization) => (
-            <SelectItem key={organization.id} value={organization.slug}>
-              {organization.name}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+    <Section title={PICKER_TITLE}>
+      <div className="max-w-sm">
+        <Combobox
+          id="operator-organization"
+          label="Organization"
+          value={slug ?? ""}
+          options={options}
+          onChange={choose}
+          placeholder="Select an organization"
+          searchPlaceholder="Search by name or ID…"
+          empty="No organizations found"
+        />
+      </div>
     </Section>
   );
 }
@@ -142,7 +170,7 @@ function OperatorOrganization({ slug }: { slug: string }) {
       <FailureAlert
         title="Entitlements unavailable"
         error={query.error}
-        fallback="Hub did not receive this organization's entitlements. Check your connection and reload the page."
+        fallback="Hub did not receive this organization's entitlements. Check your connection and reload the page"
       />
     );
   }
@@ -191,9 +219,15 @@ function OrganizationContent({ snapshot, slug }: { snapshot: Snapshot; slug: str
   return (
     <>
       <OverLimitBanner overages={snapshot.overages} />
+      <Section title="Details">
+        <SummaryPanel label="Organization details" rows={detailRows(snapshot)} />
+      </Section>
+      <Section title="Members">
+        <MemberList members={snapshot.members} />
+      </Section>
       <Section
         title="Entitlements"
-        description={`Effective values for ${snapshot.organization.name}, granted by its plan and adjusted by any manual overrides.`}
+        description={`Effective values for ${snapshot.organization.name}, granted by its plan and adjusted by any manual overrides`}
       >
         <DataTable
           label="Entitlements"
@@ -291,7 +325,7 @@ function OverLimitBanner({ overages }: { overages: Snapshot["overages"] }) {
     <WarningAlert standalone title="This organization is over its limits">
       {overages.map((overage) => (
         <p key={overage.entitlement}>
-          {`${overage.current} seats in use, but the effective limit is ${overage.limit}.`}
+          {`${overage.current} seats in use, but the effective limit is ${overage.limit}`}
         </p>
       ))}
     </WarningAlert>
@@ -363,7 +397,7 @@ function OverrideDialog({
       open
       onOpenChange={handleOpenChange}
       title={overrideTitle(target)}
-      description="Overrides are hand-set and survive plan changes. Every override — and every reset back to the plan default — is recorded in the audit trail with the reason you give."
+      description="Overrides survive plan changes and are recorded in the audit trail with the reason you give"
       label="Override entitlement"
       submitLabel="Save override"
       // "Reset to plan default" is the same form submitted for the opposite outcome: it carries
@@ -391,7 +425,7 @@ function OverrideDialog({
         <FailureAlert
           title="Override not applied"
           error={error}
-          fallback="Hub did not record this change. Try again."
+          fallback="Hub did not record this change. Try again"
         />
       )}
     </FormDialog>
@@ -444,6 +478,65 @@ function ExecutionsMonthlyControl({ limit }: { limit: number | null }) {
       defaultValue={limit === null ? "" : String(limit)}
       placeholder="Leave blank for unlimited"
     />
+  );
+}
+
+function detailRows(snapshot: Snapshot): SummaryRow[] {
+  const { organization, billing } = snapshot;
+  const rows: SummaryRow[] = [
+    { label: "Name", value: organization.name },
+    { label: "ID", identifier: organization.id },
+    { label: "Slug", identifier: organization.slug },
+    { label: "Created", value: <RelativeTime value={organization.createdAt} /> },
+  ];
+  if (billing === null) return rows;
+  return [
+    ...rows,
+    { label: "Plan", value: billing.planName ?? "No plan" },
+    { label: "Subscription", value: <Subscription subscription={billing.subscription} /> },
+    billing.stripeCustomerId === null
+      ? { label: "Stripe customer", value: "None" }
+      : { label: "Stripe customer", identifier: billing.stripeCustomerId },
+  ];
+}
+
+function Subscription({ subscription }: { subscription: OperatorSubscription }) {
+  if (subscription.kind === "unavailable") return "Unavailable";
+  if (subscription.status === null) return "None";
+  const status = statusLabel(subscription.status);
+  if (subscription.currentPeriodEnd === null) return status;
+  return (
+    <>
+      {`${status} · ${subscription.cancelAtPeriodEnd ? "cancels" : "renews"} `}
+      <RelativeTime value={subscription.currentPeriodEnd} />
+    </>
+  );
+}
+
+function MemberList({ members }: { members: Snapshot["members"] }) {
+  return (
+    <DataTable
+      label="Members"
+      columns={MEMBER_COLUMNS}
+      isEmpty={members.length === 0}
+      empty={MEMBERS_EMPTY}
+    >
+      {members.map((member) => (
+        <DataRow key={member.id}>
+          <DataCell>
+            <TwoLine primary={member.name} secondary={member.email} />
+          </DataCell>
+          <DataCell>
+            <StatusPill tone="neutral" dot={false}>
+              {ROLE_LABELS[member.role]}
+            </StatusPill>
+          </DataCell>
+          <DataCell muted>
+            <RelativeTime value={member.joinedAt} />
+          </DataCell>
+        </DataRow>
+      ))}
+    </DataTable>
   );
 }
 
@@ -525,8 +618,8 @@ function meterUsageLabel(usage: Snapshot["usage"]): string {
 
 function OrganizationPickerLoading() {
   return (
-    <Section title={PICKER_TITLE} description={PICKER_DESCRIPTION}>
-      <Skeleton aria-busy="true" className="h-9 w-full max-w-sm" />
+    <Section title={PICKER_TITLE}>
+      <Skeleton aria-busy="true" className="h-8 w-full max-w-sm" />
     </Section>
   );
 }
@@ -534,6 +627,14 @@ function OrganizationPickerLoading() {
 function OperatorOrganizationLoading() {
   return (
     <>
+      <Section title="Details">
+        <div aria-busy="true">
+          <SummaryPanel label="Organization details" rows={DETAILS_LOADING} />
+        </div>
+      </Section>
+      <Section title="Members">
+        <DataTableSkeleton label="Members" columns={MEMBER_COLUMNS} rows={2} />
+      </Section>
       <Section title="Entitlements">
         <DataTableSkeleton label="Entitlements" columns={ENTITLEMENT_COLUMNS} />
       </Section>

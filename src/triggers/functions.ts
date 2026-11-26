@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
-import { getRequest } from "@tanstack/react-start/server";
+import { getRequest, setResponseHeader } from "@tanstack/react-start/server";
 import { z } from "zod";
-import { respondOk, type Result } from "../contract/respond.js";
+import { respondError, respondOk, type Result } from "../contract/respond.js";
 import { respondWithFailure } from "../failures/index.js";
 import { getApplication } from "../server/runtime.js";
 import type { TriggerDashboard } from "./dashboard.js";
@@ -28,15 +28,23 @@ export const triggerSnapshot = createServerFn({ method: "GET" })
 
 export const saveTrigger = createServerFn({ method: "POST" })
   .validator(saveSchema)
-  .handler(async ({ data }): Promise<Result<{ state: "complete" }>> => {
+  .handler(async ({ data }): Promise<Result<SavedTrigger>> => {
     try {
       const dashboard = (await getApplication()).triggerDashboard;
       if (dashboard == null) throw new Error("trigger dashboard unavailable");
-      await dashboard.save(getRequest(), data.organizationSlug, {
-        ...(data.triggerId === undefined ? {} : { triggerId: data.triggerId }),
-        yaml: data.yaml,
-      });
-      return respondOk({ state: "complete" });
+      const { trigger, initialWebhookSecret } = await dashboard.save(
+        getRequest(),
+        data.organizationSlug,
+        {
+          ...(data.triggerId === undefined ? {} : { triggerId: data.triggerId }),
+          yaml: data.yaml,
+        },
+      );
+      if (initialWebhookSecret === undefined) {
+        return respondOk({ state: "complete", triggerId: trigger.id });
+      }
+      setResponseHeader("cache-control", "no-store");
+      return respondOk({ state: "complete", triggerId: trigger.id, initialWebhookSecret });
     } catch (error) {
       return respondWithFailure(error, triggerContext("trigger.save", data.organizationSlug), {
         fallback: error instanceof Error ? error.message : "Hub couldn't save this trigger.",
@@ -47,7 +55,44 @@ export const saveTrigger = createServerFn({ method: "POST" })
     }
   });
 
+export const rotateWebhookSecret = createServerFn({ method: "POST" })
+  .validator(
+    scopeSchema.extend({ triggerId: z.string().uuid(), action: z.enum(["create", "rotate"]) }),
+  )
+  .handler(async ({ data }): Promise<Result<{ endpointId: string; secret: string }>> => {
+    setResponseHeader("cache-control", "no-store");
+    try {
+      const dashboard = (await getApplication()).triggerDashboard;
+      if (dashboard == null) throw new Error("trigger dashboard unavailable");
+      const result = await dashboard.rotateWebhookSecret(
+        getRequest(),
+        data.organizationSlug,
+        data.triggerId,
+        data.action,
+      );
+      if (result === undefined && data.action === "create") {
+        return respondError({
+          message: "The webhook changed. Check its secret status and try again.",
+        });
+      }
+      if (result === undefined) throw new Error("Webhook trigger not found.");
+      return respondOk(result);
+    } catch (error) {
+      return respondWithFailure(error, triggerContext("webhook.rotate", data.organizationSlug), {
+        fallback: "Hub couldn't create a new webhook secret.",
+        forbidden: "You don't have permission to manage triggers.",
+      });
+    }
+  });
+
 export type TriggerSnapshot = Awaited<ReturnType<TriggerDashboard["snapshot"]>>;
+
+export interface SavedTrigger {
+  state: "complete";
+  triggerId: string;
+  /** Present when the save created a webhook endpoint. Shown once, never stored in plaintext. */
+  initialWebhookSecret?: string;
+}
 
 function triggerContext(operation: string, organizationSlug: string) {
   return { operation, component: "triggers", organizationSlug } as const;

@@ -14,7 +14,7 @@ export type WorkflowDeadlineKind = "step_hard" | "step_idle" | "whole_run";
 export interface ProviderEventReceiptRecord {
   id: string;
   organizationId: string;
-  provider: "github" | "slack" | "discord" | "linear" | "manual" | "schedule";
+  provider: "github" | "slack" | "discord" | "linear" | "manual" | "schedule" | "webhook";
   connectionId: string | null;
   resourceId: string | null;
   deliveryId: string;
@@ -41,25 +41,6 @@ export interface ProviderEventReceiptSummary {
   repo: string | null;
   receivedAt: Date;
   droppedReason: string | null;
-}
-
-/** One run as an organization overview reads it: what fired, what happened, and which agent ran. */
-export interface OrganizationRunRecord {
-  id: string;
-  /** The trigger's name as the user wrote it, never the internal name of one of its events. */
-  triggerName: string;
-  provider: ProviderEventReceiptRecord["provider"];
-  source: string;
-  status: TriggerRunRecord["status"];
-  receivedAt: Date;
-  /** The agent the dispatched launch intent named; null before dispatch or when nothing launched. */
-  agent: { provider: string; model: string | null } | null;
-}
-
-/** How many events a provider delivered that no trigger was listening for. */
-export interface UnroutedProviderEventCount {
-  provider: ProviderEventReceiptRecord["provider"];
-  count: number;
 }
 
 export interface ProviderEventRouteSnapshot {
@@ -380,6 +361,7 @@ export type ConnectionProvider = "github" | "discord" | "slack" | "linear";
 export type ConnectionAttemptPhase =
   | "github_setup"
   | "github_user_authorization"
+  | "github_selection"
   | "discord_authorization"
   | "slack_authorization"
   | "linear_authorization";
@@ -405,6 +387,8 @@ export interface ConnectionAttemptRecord {
   sessionId: string;
   candidateExternalId: string | null;
   pkceVerifier: string | null;
+  /** The GitHub accounts offered in `github_selection`, as the GitHub module stored them. */
+  installationChoices: unknown;
   configurationVersion: number;
   providerApplicationId: string | null;
   callbackOrigin: string;
@@ -474,6 +458,8 @@ export interface StartConnectionAttemptInput {
   provider: ConnectionProvider;
   stateVerifier: string;
   access: ConnectionStartAuthority;
+  /** Set when the attempt opens with a PKCE authorization, as GitHub's does. */
+  pkceVerifier?: string;
   lifetimeMinutes: number;
   configurationVersion: number;
   providerApplicationId: string;
@@ -489,10 +475,18 @@ export interface ReadConnectionAttemptInput {
   access: ConnectionAccountAccess;
 }
 
+/** Where a GitHub attempt goes next. Every step issues a new state, so an old link stops working. */
+export type GitHubConnectionAttemptStep =
+  /** Off to GitHub's install page. */
+  | { phase: "github_setup" }
+  /** Off to GitHub's authorize page, with the installation GitHub just reported, if any. */
+  | { phase: "github_user_authorization"; installationId: number | null; pkceVerifier: string }
+  /** On Hub's chooser, offering the accounts verified for this person. */
+  | { phase: "github_selection"; installationChoices: unknown };
+
 export interface AdvanceGitHubConnectionAttemptInput extends ReadConnectionAttemptInput {
   nextStateVerifier: string;
-  installationId: number;
-  pkceVerifier: string;
+  next: GitHubConnectionAttemptStep;
 }
 
 export type GitHubRepositorySnapshot = Pick<
@@ -749,6 +743,12 @@ export interface AcceptedTriggerRunRecord extends TriggerRunEvidence {
   terminalNotificationPendingAt: Date | null;
   terminalNotificationDeliveredAt: Date | null;
   terminalNotificationLeaseExpiresAt: Date | null;
+  /** Delivery attempts started, counted when an attempt claims the notification. */
+  terminalNotificationAttempts: number;
+  /** A failed attempt's backoff: the notification is not claimed again before this time. */
+  terminalNotificationNextAttemptAt: Date | null;
+  /** Set when delivery stopped for good, after a permanent failure or the last attempt. */
+  terminalNotificationAbandonedAt: Date | null;
   completedAt: Date | null;
 }
 
@@ -794,6 +794,14 @@ export interface WorkflowWakeupRecord {
   availableAt: Date;
   leaseExpiresAt: Date | null;
   leasedBeforeClaim: boolean;
+  /** The offline daemon this run waits for; `availableAt` is then only the retry. */
+  waitingForDaemonId: string | null;
+}
+
+export interface WorkflowWakeupDaemonDeferral {
+  daemonId: string;
+  releasedAt: Date;
+  retryAt: Date;
 }
 
 export interface CreateAcceptedTriggerRunInput {
@@ -914,6 +922,18 @@ export interface OperatorOrganizationRecord {
   id: string;
   name: string;
   slug: string;
+  createdAt: Date;
+}
+
+/** A member of an organization as the instance-operator surface sees it, for telling apart
+ * organizations that share a name. */
+export interface OperatorMemberRecord {
+  id: string;
+  userId: string;
+  name: string;
+  email: string;
+  role: "owner" | "admin" | "member";
+  joinedAt: Date;
 }
 
 export interface StampOrganizationEntitlementsInput {
@@ -1134,6 +1154,13 @@ export interface SaveOrganizationTriggerInput {
   routes: readonly OrganizationTriggerRoute[];
 }
 
+/** A saved trigger, and what the save created that is shown only once. */
+export interface SavedOrganizationTrigger {
+  trigger: OrganizationTriggerRecord;
+  /** The plaintext bearer secret of a webhook endpoint this save created. Only its hash is stored. */
+  initialWebhookSecret?: string;
+}
+
 export interface SwitchProjectConfigurationToManualInput {
   projectId: string;
   userId: string;
@@ -1197,7 +1224,9 @@ export interface TerminateMachineFields {
 }
 
 export interface Database {
+  readonly activity: import("../activity/index.js").ActivityStore;
   readonly executionAuthority: import("../execution-authority/index.js").ExecutionAuthorityStore;
+  readonly webhooks: import("../triggers/webhook/index.js").WebhookStore;
   readonly schedules: import("../triggers/schedule/index.js").ScheduleStore;
   findAgentSessionByKey(
     projectId: string,
@@ -1240,11 +1269,17 @@ export interface Database {
   findAgentExecutionByWorkflowStepRunId(
     stepRunId: string,
   ): Promise<AgentExecutionRecord | undefined>;
-  releaseWorkflowWakeup(triggerRunId: string, now: Date, claimedLease: Date): Promise<void>;
+  /** Release a claimed wakeup whose daemon is offline, until it connects or the retry is due. */
+  deferWorkflowWakeupForDaemon(
+    triggerRunId: string,
+    claimedLease: Date,
+    deferral: WorkflowWakeupDaemonDeferral,
+  ): Promise<void>;
+  /** Claim an available wakeup, or one waiting for a daemon in `dispatchableDaemonIds`. */
   claimWorkflowWakeup(
     now: Date,
     leaseMs: number,
-    excludedRunIds?: readonly string[],
+    dispatchableDaemonIds?: readonly string[],
   ): Promise<WorkflowWakeupRecord | undefined>;
   wakeWorkflowRun(triggerRunId: string, availableAt: Date): Promise<void>;
   deleteWorkflowWakeup(triggerRunId: string): Promise<void>;
@@ -1283,15 +1318,20 @@ export interface Database {
   ): Promise<
     { stepRun: WorkflowStepRunRecord; run: TriggerRunRecord; transitioned: boolean } | undefined
   >;
+  /** Leases the oldest due notification and counts the attempt it starts. */
   claimPendingWorkflowRunTerminalNotification(
     now: Date,
     leaseMs: number,
-  ): Promise<TriggerRunRecord | undefined>;
+  ): Promise<AcceptedTriggerRunRecord | undefined>;
   markWorkflowRunTerminalNotificationDelivered(
     triggerRunId: string,
     deliveredAt: Date,
     reactionState: JsonValue | null,
   ): Promise<void>;
+  /** Releases a failed attempt's lease and holds the notification until `nextAttemptAt`. */
+  retryWorkflowRunTerminalNotification(triggerRunId: string, nextAttemptAt: Date): Promise<void>;
+  /** Stops delivering the notification. It is never claimed again. */
+  abandonWorkflowRunTerminalNotification(triggerRunId: string, abandonedAt: Date): Promise<void>;
   setWorkflowRunReactionState(
     triggerRunId: string,
     reactionState: JsonValue | null,
@@ -1481,6 +1521,11 @@ export interface Database {
    * the operator flag at the caller. Undefined when no organization has that slug.
    */
   findOrganizationForOperator(slug: string): Promise<OperatorOrganizationRecord | undefined>;
+  /**
+   * An organization's members, owners first, without any membership check on the caller. The
+   * operator support path; gate on the operator flag at the caller.
+   */
+  listOrganizationMembersForOperator(organizationId: string): Promise<OperatorMemberRecord[]>;
   findOrganizationSlugById(organizationId: string): Promise<string | undefined>;
   /**
    * Single atomic conditional upsert: increments `used` by `amount` and returns the new
@@ -1530,10 +1575,7 @@ export interface Database {
     triggerId: string,
     revisionId: string,
   ): Promise<OrganizationTriggerRevisionRecord | undefined>;
-  findOrganizationTriggerMigrationRevision(
-    triggerId: string,
-  ): Promise<OrganizationTriggerRevisionRecord | undefined>;
-  saveOrganizationTrigger(input: SaveOrganizationTriggerInput): Promise<OrganizationTriggerRecord>;
+  saveOrganizationTrigger(input: SaveOrganizationTriggerInput): Promise<SavedOrganizationTrigger>;
   listProjectsForOrganization(organizationId: string): Promise<ProjectRecord[]>;
   findProjectForOrganization(
     organizationId: string,
@@ -1604,24 +1646,6 @@ export interface Database {
     connectionId: string,
     repositoryId: number,
   ): Promise<GitHubConfigurationTarget[]>;
-  listUnroutedProviderEventsForOrganization(
-    organizationId: string,
-  ): Promise<ProviderEventReceiptSummary[]>;
-  /** Newest first, every run the organization's triggers started at or after `since`. */
-  listOrganizationRunsSince(
-    organizationId: string,
-    since: Date,
-    limit: number,
-  ): Promise<OrganizationRunRecord[]>;
-  /**
-   * Events received at or after `since` that were dropped because no trigger listens for them
-   * (`no_project_route`, `no_trigger_for_source`), counted per provider. A filter that declined
-   * an event is a trigger listening, so those drops are not counted.
-   */
-  countUnroutedProviderEventsSince(
-    organizationId: string,
-    since: Date,
-  ): Promise<UnroutedProviderEventCount[]>;
   isOrganizationMember(userId: string, organizationId: string): Promise<boolean>;
   startConnectionAttempt(input: StartConnectionAttemptInput): Promise<void>;
   findConnectionAttemptConfiguration(

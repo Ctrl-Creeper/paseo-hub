@@ -5,6 +5,9 @@ test("creates a twice-daily schedule, edits weekly recurrence, and preserves it 
   hub,
   page,
 }) => {
+  // Seven steps and ten save-and-reload round trips take about 17s alone on a
+  // developer machine; on CI with two workers they overrun the default 30s.
+  test.slow();
   await hub.signUpAs("owner", {
     name: "Schedule Owner",
     email: "schedule-owner@example.com",
@@ -12,11 +15,15 @@ test("creates a twice-daily schedule, edits weekly recurrence, and preserves it 
   });
   await hub.createOrganization("owner", "Acme");
   const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  await hub.connectGitHub("owner");
+  await hub.seedSlackConnection("owner", "company-slack", "Acme Slack");
+  await hub.seedDiscordConnection("Acme", "company-discord");
   const triggers = new OrganizationTriggers(page);
   await test.step("create a twice-daily schedule using normal execution settings", async () => {
     await triggers.open();
     await triggers.startNew();
     await triggers.configureSchedule(daemon);
+    await triggers.grantScheduledIntegrationTools();
     await triggers.captureSchedule("e2e/screenshots/schedules/daily.png");
     await triggers.switchToYaml();
     await triggers.expectYamlContains(
@@ -24,6 +31,12 @@ test("creates a twice-daily schedule, edits weekly recurrence, and preserves it 
       "FREQ=DAILY",
       "Europe/Berlin",
       "thinkingOptionId: low",
+      "connection: acme-inc-github",
+      "acme-inc/hub",
+      "connection: company-slack",
+      "connection: company-discord",
+      "CALLOWED",
+      "123456789012345678",
     );
     await triggers.save("periodic-scan");
   });
@@ -34,6 +47,7 @@ test("creates a twice-daily schedule, edits weekly recurrence, and preserves it 
     await triggers.capture("e2e/screenshots/schedules/summary.png");
     await triggers.openTrigger("periodic-scan");
     await triggers.expectScheduleAfterReload();
+    await triggers.expectScheduledIntegrationTools();
     await triggers.captureSchedule("e2e/screenshots/schedules/weekly.png");
     await triggers.captureScheduleAtPhoneWidth("e2e/screenshots/schedules/mobile.png");
     await triggers.switchToYaml();

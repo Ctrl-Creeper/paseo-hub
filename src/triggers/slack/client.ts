@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { reportFailure } from "../../failures/index.js";
+import { reportFailure, UpstreamFailure, type FailureKind } from "../../failures/index.js";
 
 const SlackApiResponseSchema = z
   .object({ ok: z.boolean(), error: z.string().optional() })
@@ -40,6 +40,7 @@ const SlackUserInfoSchema = SlackApiResponseSchema.extend({
 const SLACK_API_TIMEOUT_MS = 10_000;
 const SLACK_THREAD_REPLIES_MAX_PAGES = 10;
 const SLACK_THREAD_CONTEXT_LIMIT = 50;
+const SLACK_REACTION_TARGET_GONE = ["message_not_found", "channel_not_found"] as const;
 
 export interface SlackAttachmentMetadata {
   id: string;
@@ -102,6 +103,57 @@ export interface SlackBotClient {
   }): Promise<Response>;
 }
 
+/**
+ * Slack's answer to a refused call. Hub logs the code; the message is never logged. The code
+ * decides the failure kind, so a revoked token or a channel the bot left is not retried.
+ */
+export class SlackApiError extends UpstreamFailure {
+  readonly code: string;
+
+  constructor(error: string | undefined, options: { retryAfterMs?: number } = {}) {
+    const code = error ?? "unknown_error";
+    super(`Slack API ${code}`, SLACK_ERROR_KINDS.get(code) ?? "internal", options);
+    this.name = "SlackApiError";
+    this.code = code;
+  }
+}
+
+const SLACK_ERROR_KINDS = new Map<string, FailureKind>([
+  ["ratelimited", "rateLimited"],
+  ["invalid_auth", "credentialsRejected"],
+  ["not_authed", "credentialsRejected"],
+  ["account_inactive", "credentialsRejected"],
+  ["token_revoked", "credentialsRejected"],
+  ["token_expired", "credentialsRejected"],
+  ["missing_scope", "permissionMissing"],
+  ["no_permission", "permissionMissing"],
+  ["not_allowed_token_type", "permissionMissing"],
+  ["not_in_channel", "forbidden"],
+  ["is_archived", "forbidden"],
+  ["restricted_action", "forbidden"],
+  ["channel_not_found", "notFound"],
+  ["message_not_found", "notFound"],
+  ["invalid_name", "validation"],
+  ["too_many_reactions", "validation"],
+]);
+
+function workspaceNotConnected(): UpstreamFailure {
+  return new UpstreamFailure("Slack workspace is not connected", "credentialsRejected");
+}
+
+/** Slack answers a rate-limited call with HTTP 429 and the seconds to wait in `Retry-After`. */
+function throwForHttpStatus(response: Response): void {
+  if (response.ok) return;
+  if (response.status === 429) {
+    const seconds = Number(response.headers.get("retry-after"));
+    throw new SlackApiError(
+      "ratelimited",
+      Number.isFinite(seconds) && seconds > 0 ? { retryAfterMs: seconds * 1_000 } : {},
+    );
+  }
+  throw new Error(`Slack API HTTP ${response.status}`);
+}
+
 export function createSlackBotClient(options: {
   tokenForWorkspace(organizationId: string, teamId: string): Promise<string | undefined>;
   fetch?: typeof fetch;
@@ -113,10 +165,11 @@ export function createSlackBotClient(options: {
     organizationId: string,
     teamId: string,
     method: string,
-    body: Record<string, string>,
+    body: Record<string, string | boolean>,
+    settledErrors: readonly string[] = [],
   ): Promise<void> {
     const token = await options.tokenForWorkspace(organizationId, teamId);
-    if (token === undefined) throw new Error("Slack workspace is not connected");
+    if (token === undefined) throw workspaceNotConnected();
     const response = await request(`https://slack.com/api/${method}`, {
       method: "POST",
       headers: {
@@ -126,30 +179,11 @@ export function createSlackBotClient(options: {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(options.requestTimeoutMs ?? SLACK_API_TIMEOUT_MS),
     });
-    if (!response.ok) throw new Error(`Slack API HTTP ${response.status}`);
+    throwForHttpStatus(response);
     const result = SlackApiResponseSchema.parse(await response.json());
-    if (!result.ok) throw new Error(`Slack API ${result.error ?? "unknown_error"}`);
-  }
-
-  async function callJson(
-    organizationId: string,
-    teamId: string,
-    method: string,
-    body: Record<string, string>,
-  ): Promise<unknown> {
-    const token = await options.tokenForWorkspace(organizationId, teamId);
-    if (token === undefined) throw new Error("Slack workspace is not connected");
-    const response = await request(`https://slack.com/api/${method}`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json; charset=utf-8",
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(options.requestTimeoutMs ?? SLACK_API_TIMEOUT_MS),
-    });
-    if (!response.ok) throw new Error(`Slack API HTTP ${response.status}`);
-    return response.json();
+    if (!result.ok && !settledErrors.includes(result.error ?? "")) {
+      throw new SlackApiError(result.error);
+    }
   }
 
   async function queryJson(
@@ -159,7 +193,7 @@ export function createSlackBotClient(options: {
     query: Record<string, string>,
   ): Promise<unknown> {
     const token = await options.tokenForWorkspace(organizationId, teamId);
-    if (token === undefined) throw new Error("Slack workspace is not connected");
+    if (token === undefined) throw workspaceNotConnected();
     const url = new URL(`https://slack.com/api/${method}`);
     for (const [name, value] of Object.entries(query)) url.searchParams.set(name, value);
     const response = await request(url, {
@@ -167,7 +201,7 @@ export function createSlackBotClient(options: {
       headers: { authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(options.requestTimeoutMs ?? SLACK_API_TIMEOUT_MS),
     });
-    if (!response.ok) throw new Error(`Slack API HTTP ${response.status}`);
+    throwForHttpStatus(response);
     return response.json();
   }
 
@@ -197,7 +231,7 @@ export function createSlackBotClient(options: {
             ...(cursor === undefined ? {} : { cursor }),
           }),
         );
-        if (!result.ok) throw new Error(`Slack API ${result.error ?? "unknown_error"}`);
+        if (!result.ok) throw new SlackApiError(result.error);
       } catch (error) {
         if (root === undefined && selectedReplies.length === 0) throw error;
         reportFailure(
@@ -246,11 +280,12 @@ export function createSlackBotClient(options: {
     fileId: string;
   }): Promise<Response> {
     const token = await options.tokenForWorkspace(input.organizationId, input.teamId);
-    if (token === undefined) throw new Error("Slack workspace is not connected");
+    if (token === undefined) throw workspaceNotConnected();
     const result = SlackFileInfoSchema.parse(
-      await callJson(input.organizationId, input.teamId, "files.info", { file: input.fileId }),
+      await queryJson(input.organizationId, input.teamId, "files.info", { file: input.fileId }),
     );
-    if (!result.ok || result.file?.id !== input.fileId) {
+    if (!result.ok) throw new SlackApiError(result.error);
+    if (result.file?.id !== input.fileId) {
       throw new Error(`Slack file ${input.fileId} is unavailable`);
     }
     const downloadUrl = new URL(result.file.url_private_download);
@@ -273,9 +308,9 @@ export function createSlackBotClient(options: {
     userId: string;
   }): Promise<string | undefined> {
     const result = SlackUserInfoSchema.parse(
-      await callJson(input.organizationId, input.teamId, "users.info", { user: input.userId }),
+      await queryJson(input.organizationId, input.teamId, "users.info", { user: input.userId }),
     );
-    if (!result.ok) throw new Error(`Slack API ${result.error ?? "unknown_error"}`);
+    if (!result.ok) throw new SlackApiError(result.error);
     return result.user?.name;
   }
 
@@ -285,19 +320,28 @@ export function createSlackBotClient(options: {
         channel: input.channelId,
         thread_ts: input.threadTs,
         text: input.content,
+        unfurl_links: false,
+        unfurl_media: false,
       }),
+    // A retried delivery finds the reaction already in place, or already gone. When the
+    // message or its channel is gone there is nothing left to react to, and retrying
+    // cannot succeed.
     addReaction: (input) =>
-      call(input.organizationId, input.teamId, "reactions.add", {
-        channel: input.channelId,
-        timestamp: input.messageTs,
-        name: input.name,
-      }),
+      call(
+        input.organizationId,
+        input.teamId,
+        "reactions.add",
+        { channel: input.channelId, timestamp: input.messageTs, name: input.name },
+        ["already_reacted", ...SLACK_REACTION_TARGET_GONE],
+      ),
     removeReaction: (input) =>
-      call(input.organizationId, input.teamId, "reactions.remove", {
-        channel: input.channelId,
-        timestamp: input.messageTs,
-        name: input.name,
-      }),
+      call(
+        input.organizationId,
+        input.teamId,
+        "reactions.remove",
+        { channel: input.channelId, timestamp: input.messageTs, name: input.name },
+        ["no_reaction", ...SLACK_REACTION_TARGET_GONE],
+      ),
     readThreadMessages,
     lookupUserName,
     downloadAttachment,

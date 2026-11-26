@@ -1,3 +1,4 @@
+import type { IntegrationToolHandlers } from "../integration-tools/index.js";
 import type { ProjectConfigurationStore } from "../configuration/store.js";
 import type { ConnectionResolutionContext, ConnectionResolver } from "../config/connections.js";
 import type { OrganizationConnectionUsage } from "../db/types.js";
@@ -76,6 +77,7 @@ export interface ProviderRegistration {
   triggerProviders: readonly TriggerProviderFactory[];
   sources: readonly TriggerSource[];
   outputs: readonly ProviderOutputRegistration[];
+  integrationTools?: IntegrationToolHandlers;
   requests: readonly ProviderRequestRegistration[];
   attachment?: ProviderAttachmentRegistration;
   slackDelivery?: { status(): SlackDeliveryStatus; retry(): Promise<void> };

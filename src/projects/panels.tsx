@@ -35,6 +35,7 @@ import {
   type ConnectionDisconnectResult,
   type ConnectionStatus,
 } from "../connections/functions.js";
+import { ActivityLink } from "../activity/link.js";
 import { useRouteTenant } from "./context.js";
 import type { ProjectDashboard } from "./dashboard.js";
 import {
@@ -50,14 +51,14 @@ import {
   type ProjectSnapshot,
 } from "./panel-state.js";
 import { archiveProject, activityRunSnapshot, updateProjectSlug } from "./functions.js";
-const CONNECTIONS_DESCRIPTION = "Organization provider connections.";
+const INTEGRATIONS_DESCRIPTION = "Where this organization's events come from";
 const CONNECTION_PROVIDERS = ["github", "discord", "slack", "linear"] as const;
 type ConnectionProviderName = (typeof CONNECTION_PROVIDERS)[number];
 
-function ConnectionsLoading() {
+function IntegrationsLoading() {
   return (
     <>
-      <PageHeader title="Connections" description={CONNECTIONS_DESCRIPTION} />
+      <PageHeader title="Integrations" description={INTEGRATIONS_DESCRIPTION} />
       <Section>
         {CONNECTION_PROVIDERS.map((provider) => (
           <CardSkeleton key={provider} lines={2} />
@@ -67,12 +68,12 @@ function ConnectionsLoading() {
   );
 }
 
-export function OrganizationConnectionsPanel() {
+export function OrganizationIntegrationsPanel() {
   const tenant = useRouteTenant();
   const { isInstanceOperator } = useActiveAccount();
   const queryClient = useQueryClient();
   const scope = { organizationSlug: tenant.organization.slug };
-  const snapshot = useOrganizationSnapshot(<ConnectionsLoading />);
+  const snapshot = useOrganizationSnapshot(<IntegrationsLoading />);
   const loadStatus = useServerFn(connectionStatus);
   const statusQuery = useSnapshotQuery({
     queryKey: ["connection-status", tenant.account.id, tenant.organization.id],
@@ -102,8 +103,8 @@ export function OrganizationConnectionsPanel() {
   if (!snapshot.ok) return snapshot.element;
   const status = queryState<ConnectionStatus>(
     statusQuery,
-    "Connections unavailable",
-    <ConnectionsLoading />,
+    "Integrations unavailable",
+    <IntegrationsLoading />,
   );
   if (!status.ok) return status.element;
   const data = snapshot.data;
@@ -169,23 +170,25 @@ export function OrganizationConnectionsPanel() {
   const nothingToConnect = CONNECTION_PROVIDERS.every(
     (provider) => status.data[provider].status === "notConfigured",
   )
-    ? "This Hub has no provider apps set up yet. Ask whoever runs it to add one."
-    : "An organization owner connects the providers this organization can use.";
+    ? "No provider apps are set up on this Hub yet. Ask whoever runs it to add one"
+    : "An organization owner connects the providers this organization can use";
   return (
     <>
-      <PageHeader title="Connections" description={CONNECTIONS_DESCRIPTION} />
+      <PageHeader title="Integrations" description={INTEGRATIONS_DESCRIPTION} />
       {returned === undefined ? null : (
         <ConnectionReturnBanner copy={connectionReturnCopy(returned)} />
       )}
       <CommandError mutations={[connect, disconnect]} />
       <Section>
         {shown.length === 0 ? (
-          <EmptyState title="No connections" description={nothingToConnect} />
+          <EmptyState title="No integrations" description={nothingToConnect} />
         ) : (
           shown.map(({ provider, connections, action }) => (
             <ProviderConnections
               key={provider}
               provider={provider}
+              organizationSlug={scope.organizationSlug}
+              activity={data.providerActivity.find((entry) => entry.provider === provider)}
               connections={connections}
               canManage={data.capabilities.manageResources}
               busy={busy}
@@ -196,12 +199,6 @@ export function OrganizationConnectionsPanel() {
             />
           ))
         )}
-      </Section>
-      <Section
-        title="Known unrouted events"
-        description="Events received for this organization that were not routed to a workflow."
-      >
-        <ActivityTable activity={data.unroutedEvents} label="Unrouted events" showReason />
       </Section>
     </>
   );
@@ -214,6 +211,8 @@ export function OrganizationConnectionsPanel() {
  */
 function ProviderConnections({
   provider,
+  organizationSlug,
+  activity,
   connections,
   canManage,
   busy,
@@ -221,6 +220,9 @@ function ProviderConnections({
   onRevoke,
 }: {
   provider: ConnectionProviderName;
+  organizationSlug: string;
+  /** The provider's runs in the last week; absent when none ran. */
+  activity: OrganizationSnapshot["providerActivity"][number] | undefined;
   connections: readonly ConnectionRecord[];
   canManage: boolean;
   busy: boolean;
@@ -233,6 +235,35 @@ function ProviderConnections({
       icon={<ProviderGlyph provider={provider} />}
       title={label}
       {...(action === undefined ? {} : { action })}
+      {...(connections.length === 0
+        ? {}
+        : {
+            footer: {
+              note: providerWeek(activity),
+              actions: (
+                <>
+                  <Button variant="outline" size="sm" asChild>
+                    <ActivityLink
+                      organizationSlug={organizationSlug}
+                      search={{ provider }}
+                      aria-label={`View ${label} runs`}
+                    >
+                      View runs
+                    </ActivityLink>
+                  </Button>
+                  <Button variant="outline" size="sm" asChild>
+                    <ActivityLink
+                      organizationSlug={organizationSlug}
+                      search={{ view: "unmatched", provider }}
+                      aria-label={`${label} unmatched events`}
+                    >
+                      Unmatched events
+                    </ActivityLink>
+                  </Button>
+                </>
+              ),
+            },
+          })}
     >
       {connections.length === 0 ? null : (
         <RecordList label={`${label} connections`}>
@@ -259,7 +290,7 @@ function ProviderConnections({
                       destructive
                       label="Revoke"
                       title={`Revoke ${connection.name}?`}
-                      description="Projects using this credential will stop receiving new events."
+                      description="Projects using this credential will stop receiving new events"
                       confirmLabel="Revoke connection"
                       cancelLabel="Cancel"
                       onConfirm={() => onRevoke(connection.id)}
@@ -275,6 +306,13 @@ function ProviderConnections({
       )}
     </Card>
   );
+}
+
+/** `84 runs · 3 failed in the last 7 days`: what a connection's events started this week. */
+function providerWeek(activity: { runs: number; failed: number } | undefined): string {
+  const runs = activity?.runs ?? 0;
+  const failed = activity?.failed ?? 0;
+  return `${runs.toLocaleString("en-US")} ${runs === 1 ? "run" : "runs"} · ${failed.toLocaleString("en-US")} failed in the last 7 days`;
 }
 
 export function OrganizationDaemonsPanel() {
@@ -298,7 +336,7 @@ export function ProjectOverviewPanel() {
     <>
       <PageHeader
         title="Overview"
-        description={`Setup and recent operations for ${data.project.name}.`}
+        description={`Setup and recent operations for ${data.project.name}`}
       />
       <Section className="sm:grid-cols-2">
         <SetupCard
@@ -311,7 +349,7 @@ export function ProjectOverviewPanel() {
           }
         />
         <SetupCard
-          label="Connections"
+          label="Integrations"
           ready={
             data.connections.github.length +
               data.connections.discord.length +
@@ -325,7 +363,7 @@ export function ProjectOverviewPanel() {
       <Section
         title="Recent activity"
         action={
-          <Button variant="link" asChild>
+          <Button variant="outline" size="sm" asChild>
             <Link to={`${base}/activity` as never}>View all</Link>
           </Button>
         }
@@ -346,7 +384,7 @@ export function ProjectActivityPanel() {
   if (!snapshot.ok) return snapshot.element;
   return (
     <>
-      <PageHeader title="Activity" description="Provider events routed to this project." />
+      <PageHeader title="Activity" description="Provider events routed to this project" />
       <ActivityTable
         activity={snapshot.data.activity}
         label="Project activity"
@@ -385,7 +423,7 @@ export function ProjectActivityRunPanel({ runId }: { runId: string }) {
       <Section title="Invocation">
         <SummaryPanel label="Invocation" rows={invocationRows(activity)} />
       </Section>
-      <Section title="Steps" description="Ordered durable step state and structured outputs.">
+      <Section title="Steps" description="Ordered durable step state and structured outputs">
         <DataTable
           label="Run steps"
           columns={[
@@ -485,10 +523,7 @@ export function ProjectGeneralSettingsPanel() {
       <CommandError mutations={[updateSlug, archive]} />
       {data.capabilities.manageResources ? (
         <>
-          <Section
-            title="Project URL"
-            description="Changing the slug deliberately breaks old project URLs."
-          >
+          <Section title="Project URL" description="Changing the slug breaks old project URLs">
             <form
               aria-label="Change project slug"
               className="grid max-w-md gap-4"
@@ -512,7 +547,7 @@ export function ProjectGeneralSettingsPanel() {
             <ConfirmAction
               label="Archive project"
               title={`Archive ${data.project.name}?`}
-              description="Routing is released; running recovery and history remain."
+              description="Routing stops, while running recovery and history remain"
               confirmLabel="Archive project"
               cancelLabel="Cancel"
               busy={archive.isPending}
@@ -530,7 +565,7 @@ function SettingsPage({ children }: { children: ReactNode }) {
   if (tenant.project === null) throw new Error("settings route has no project");
   return (
     <>
-      <PageHeader title="Settings" description={`Project settings for ${tenant.project.name}.`} />
+      <PageHeader title="Settings" description={`Project settings for ${tenant.project.name}`} />
       {children}
     </>
   );
@@ -575,7 +610,7 @@ function invocationRows(activity: RunActivity): readonly SummaryRow[] {
       ),
     },
     { label: "Failure reason", value: activity.failureReason ?? "—" },
-    { label: "Delivery", value: <span className="font-mono text-xs">{activity.deliveryId}</span> },
+    { label: "Delivery", identifier: activity.deliveryId },
   ];
 }
 
@@ -594,15 +629,10 @@ function ActivityTable({
   activity,
   label,
   detailBasePath,
-  showReason = false,
 }: {
-  activity: ReadonlyArray<
-    | ProjectSnapshot["activity"][number]
-    | Awaited<ReturnType<ProjectDashboard["organizationSnapshot"]>>["unroutedEvents"][number]
-  >;
+  activity: readonly ProjectSnapshot["activity"][number][];
   label: string;
   detailBasePath?: string;
-  showReason?: boolean;
 }) {
   return (
     <DataTable
@@ -612,14 +642,13 @@ function ActivityTable({
         { header: "Provider" },
         { header: "Source" },
         { header: "Status" },
-        ...(showReason ? [{ header: "Reason", fill: true }] : []),
         { header: "Received" },
       ]}
       isEmpty={activity.length === 0}
       empty={{ title: "No activity" }}
     >
       {activity.map((event) => {
-        const status = "status" in event ? event.status : "dropped";
+        const status = event.status;
         return (
           <DataRow key={event.id}>
             <DataCell>
@@ -628,11 +657,9 @@ function ActivityTable({
                   detailBasePath &&
                   "configuredTriggerName" in event &&
                   event.configuredTriggerName !== null ? (
-                    <Button variant="link" asChild>
-                      <Link to={`${detailBasePath}/${event.id}` as never}>
-                        {event.configuredTriggerName}
-                      </Link>
-                    </Button>
+                    <Link to={`${detailBasePath}/${event.id}` as never} className="hover:underline">
+                      {event.configuredTriggerName}
+                    </Link>
                   ) : (
                     <span className="font-mono">{event.id.slice(0, 12)}</span>
                   )
@@ -645,7 +672,6 @@ function ActivityTable({
             <DataCell>
               <StatusPill tone={executionTone(status)}>{statusLabel(status)}</StatusPill>
             </DataCell>
-            {showReason ? <DataCell>{event.failureReason ?? "Unknown reason"}</DataCell> : null}
             <DataCell muted>
               <RelativeTime value={event.receivedAt} />
             </DataCell>
@@ -669,7 +695,7 @@ function ConnectionReturnBanner({ copy }: { copy: ConnectionReturnCopy }) {
         standalone
         title={copy.title}
         error={copy.message}
-        fallback="Hub couldn't finish the connection. Start it again from this page."
+        fallback="Hub couldn't finish the connection. Start it again from this page"
       />
     );
   }

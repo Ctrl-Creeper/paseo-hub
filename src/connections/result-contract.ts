@@ -27,6 +27,10 @@ export const connectionResultSchema = z.enum([
   "slack_cancelled",
   "linear_cancelled",
   "github_approval_required",
+  /** GitHub refused the authorization, or named an installation this attempt never verified. */
+  "github_verification_rejected",
+  /** GitHub showed the person, but not as an owner of the account they tried to connect. */
+  "github_not_owner",
   "slack_bot_failed",
   "provider_not_configured",
   /** The state was forged, expired, already used, or belongs to a different session. */
@@ -54,11 +58,11 @@ export type ConnectionReturnCopy =
 /**
  * Where a callback lands when the attempt that started it cannot be read, so neither the
  * organization nor the surface is known. The connections landing forwards to the active
- * organization's connections page; when no organization is active yet, the shell's own gates
+ * organization's integrations page; when no organization is active yet, the shell's own gates
  * render first and the return survives in the query until a connections surface reads it.
  * Never the dashboard landing: that is not a connections surface.
  */
-export const CONNECTIONS_RETURN_ROUTE = "/connections";
+export const INTEGRATIONS_RETURN_ROUTE = "/integrations";
 
 const RETURN_PARAMS = { provider: "app", result: "result", reference: "reference" } as const;
 
@@ -145,55 +149,65 @@ const RETURN_COPY: Readonly<Record<ConnectionResult, (name: string) => Connectio
   discord_disconnected: disconnected,
   slack_disconnected: disconnected,
   linear_disconnected: disconnected,
-  github_cancelled: (name) => cancelled("Installation", name),
+  github_cancelled: (name) => cancelled("Authorization", name),
   slack_cancelled: (name) => cancelled("Installation", name),
   discord_cancelled: (name) => cancelled("Authorization", name),
   linear_cancelled: (name) => cancelled("Authorization", name),
   github_approval_required: (name) =>
     failed(
       name,
-      "A GitHub organization owner has to approve this installation. Nothing was connected. Ask an owner to approve the request, then install again.",
+      "A GitHub organization owner has to approve this installation. Nothing was connected. Ask an owner to approve the request, then install again",
+    ),
+  github_verification_rejected: (name) =>
+    failed(
+      name,
+      "GitHub didn't confirm that you can connect that account. Nothing was connected. Start the connection again from this page",
+    ),
+  github_not_owner: (name) =>
+    failed(
+      name,
+      "GitHub doesn't show you as an owner of that account. Nothing was connected. Ask an owner to connect it, or pick an account you own",
     ),
   slack_bot_failed: (name) =>
     failed(
       name,
-      "Slack installed the app without every permission Hub needs. Nothing was saved. Reapply the manifest under Features → OAuth & Permissions, then install again.",
+      "Slack installed the app without every permission Hub needs. Nothing was saved. Reapply the manifest under Features → OAuth & Permissions, then install again",
     ),
   provider_not_configured: (name) =>
-    failed(name, "There are no saved credentials to connect yet. Verify and save the app first."),
+    failed(name, "There are no saved credentials to connect yet. Verify and save the app first"),
   connection_invalid: (name) =>
     failed(
       name,
-      "That connection link had already been used or had expired, so it was refused. Nothing was connected. Start the connection again from this page.",
+      "That connection link had already been used or had expired, so it was refused. Nothing was connected. Start the connection again from this page",
     ),
   connection_conflict: (name) =>
     failed(
       name,
-      "That account is already connected to another organization. Nothing was connected. Disconnect it there, or pick a different one.",
+      "That account is already connected to another organization. Nothing was connected. Disconnect it there, or pick a different one",
     ),
   connection_unauthenticated: (name) =>
     failed(
       name,
-      `${name} sent you back to a Hub address this browser isn't signed in to, so nothing was connected. Sign in there, or ask your Hub operator to check the ${name} app's callback and setup URLs, then start the connection again.`,
+      `${name} sent you back to a Hub address this browser isn't signed in to, so nothing was connected. Sign in there, or ask your Hub operator to check the ${name} app's callback and setup URLs, then start the connection again`,
     ),
   connection_unavailable: (name) =>
     failed(
       name,
-      `Hub couldn't finish the ${name} connection. Nothing was connected. Start the connection again from this page.`,
+      `Hub couldn't finish the ${name} connection. Nothing was connected. Start the connection again from this page`,
     ),
 };
 
 function connected(name: string): ConnectionReturnCopy {
-  return { tone: "success", message: `${name} connected.` };
+  return { tone: "success", message: `${name} connected` };
 }
 
 function disconnected(name: string): ConnectionReturnCopy {
-  return { tone: "success", message: `${name} disconnected.` };
+  return { tone: "success", message: `${name} disconnected` };
 }
 
 function cancelled(action: "Installation" | "Authorization", name: string): ConnectionReturnCopy {
   return {
     tone: "success",
-    message: `${action} cancelled at ${name}. Nothing changed. Start again when you're ready.`,
+    message: `${action} cancelled at ${name}. Nothing changed. Start again when you're ready`,
   };
 }

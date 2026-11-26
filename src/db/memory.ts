@@ -3,7 +3,6 @@ import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
-import { launchedAgent } from "./mappers.js";
 import type {
   AgentExecutionRecord,
   AgentExecutionOutputAttempt,
@@ -66,11 +65,10 @@ import type {
   GitHubRepositoryRecord,
   GitHubRepositorySnapshot,
   OrganizationConnectionUsage,
-  OrganizationRunRecord,
-  UnroutedProviderEventCount,
   ProjectTriggerRoute,
   MigrateProjectTriggersInput,
   OrganizationTriggerRecord,
+  SavedOrganizationTrigger,
   OrganizationTriggerRevisionRecord,
   PendingProjectTriggerMigration,
   SaveOrganizationTriggerInput,
@@ -82,6 +80,7 @@ import type {
   TriggerRunRecord,
   WorkflowStepExecutionInput,
   WorkflowStepRunRecord,
+  WorkflowWakeupDaemonDeferral,
   WorkflowWakeupRecord,
   WorkflowAgentCompletionInput,
   WorkflowDeadlineKind,
@@ -89,6 +88,7 @@ import type {
   ProjectActivityRunListRecord,
   OrganizationEntitlementsRecord,
   OperatorOrganizationRecord,
+  OperatorMemberRecord,
   StampOrganizationEntitlementsInput,
   OverrideOrganizationEntitlementsInput,
   ClearOrganizationEntitlementsOverrideInput,
@@ -108,10 +108,7 @@ import {
   mergeOverrides,
 } from "../entitlements/catalog.js";
 import { toProviderEventReceiptRecordSummary } from "./mappers.js";
-import {
-  isProviderEventDropReasonCode,
-  type ProviderEventDropReasonCode,
-} from "../triggers/drop-reason.js";
+import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
 
 const OUTPUT_ATTEMPT_LEASE_MS = 5 * 60_000;
 
@@ -160,6 +157,58 @@ export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Datab
 
 class MemoryDatabase implements Database {
   // This test double has no background work. Scheduling tests use the actual embedded/PG runtime.
+  // Activity reads are SQL aggregates; their tests run against Postgres and embedded PGlite.
+  readonly activity: import("../activity/index.js").ActivityStore = {
+    async listRuns() {
+      return { rows: [], total: 0, totalCapped: false, hasNext: false };
+    },
+    async listUnmatched() {
+      return { rows: [], total: 0, totalCapped: false, hasNext: false };
+    },
+    async filterOptions() {
+      return { triggers: [], daemons: [] };
+    },
+    async findRun() {
+      return undefined;
+    },
+    async findUnmatched() {
+      return undefined;
+    },
+    async findRunIdForExecution() {
+      return undefined;
+    },
+    async summarize() {
+      return {
+        statuses: { running: 0, succeeded: 0, failed: 0, timed_out: 0, rejected: 0 },
+        triggers: [],
+        daemons: [],
+      };
+    },
+    async summarizeProviders() {
+      return [];
+    },
+    async latestRun() {
+      return undefined;
+    },
+    async lastRuns() {
+      return [];
+    },
+  };
+  readonly webhooks: import("../triggers/webhook/index.js").WebhookStore = {
+    async list() {
+      return [];
+    },
+    async rotate() {
+      return undefined;
+    },
+    async authenticate() {
+      return undefined;
+    },
+    async accept() {
+      return { status: "unauthorized" };
+    },
+  };
+
   get schedules(): import("../triggers/schedule/index.js").ScheduleStore {
     return (
       this.options.schedules ?? {
@@ -284,6 +333,9 @@ class MemoryDatabase implements Database {
       terminalNotificationPendingAt: null,
       terminalNotificationDeliveredAt: null,
       terminalNotificationLeaseExpiresAt: null,
+      terminalNotificationAttempts: 0,
+      terminalNotificationNextAttemptAt: null,
+      terminalNotificationAbandonedAt: null,
       createdAt: now,
       completedAt: null,
     };
@@ -315,6 +367,7 @@ class MemoryDatabase implements Database {
       availableAt: now,
       leaseExpiresAt: null,
       leasedBeforeClaim: false,
+      waitingForDaemonId: null,
     });
     return { run, created: true };
   }
@@ -414,25 +467,42 @@ class MemoryDatabase implements Database {
     );
   }
 
-  async releaseWorkflowWakeup(triggerRunId: string, now: Date, claimedLease: Date) {
+  async deferWorkflowWakeupForDaemon(
+    triggerRunId: string,
+    claimedLease: Date,
+    deferral: WorkflowWakeupDaemonDeferral,
+  ) {
     const wakeup = this.workflowWakeups.get(triggerRunId);
-    if (wakeup?.leaseExpiresAt?.getTime() === claimedLease.getTime()) wakeup.leaseExpiresAt = now;
+    if (wakeup?.leaseExpiresAt?.getTime() !== claimedLease.getTime()) return;
+    this.workflowWakeups.set(triggerRunId, {
+      ...wakeup,
+      leaseExpiresAt: deferral.releasedAt,
+      availableAt: deferral.retryAt,
+      waitingForDaemonId: deferral.daemonId,
+    });
   }
 
-  async claimWorkflowWakeup(now: Date, leaseMs: number, excludedRunIds: readonly string[] = []) {
+  async claimWorkflowWakeup(
+    now: Date,
+    leaseMs: number,
+    dispatchableDaemonIds: readonly string[] = [],
+  ) {
     const candidate = Array.from(this.workflowWakeups.values())
       .filter(
         (wakeup) =>
-          !excludedRunIds.includes(wakeup.triggerRunId) &&
-          wakeup.availableAt <= now &&
+          (wakeup.availableAt <= now ||
+            (wakeup.waitingForDaemonId !== null &&
+              dispatchableDaemonIds.includes(wakeup.waitingForDaemonId))) &&
           (wakeup.leaseExpiresAt === null || wakeup.leaseExpiresAt <= now),
       )
       .sort((left, right) => left.availableAt.getTime() - right.availableAt.getTime())[0];
     if (candidate === undefined) return undefined;
     const claimed = {
       ...candidate,
+      availableAt: candidate.availableAt <= now ? candidate.availableAt : now,
       leaseExpiresAt: new Date(now.getTime() + leaseMs),
       leasedBeforeClaim: candidate.leaseExpiresAt !== null,
+      waitingForDaemonId: null,
     };
     this.workflowWakeups.set(candidate.triggerRunId, claimed);
     return claimed;
@@ -448,6 +518,7 @@ class MemoryDatabase implements Database {
           : current.availableAt,
       leaseExpiresAt: null,
       leasedBeforeClaim: false,
+      waitingForDaemonId: null,
     });
   }
 
@@ -680,6 +751,7 @@ class MemoryDatabase implements Database {
           availableAt: now,
           leaseExpiresAt: null,
           leasedBeforeClaim: false,
+          waitingForDaemonId: null,
         });
       }
       return;
@@ -887,6 +959,7 @@ class MemoryDatabase implements Database {
       availableAt: now,
       leaseExpiresAt: null,
       leasedBeforeClaim: false,
+      waitingForDaemonId: null,
     });
     return { stepRun: updatedStep, run };
   }
@@ -964,6 +1037,7 @@ class MemoryDatabase implements Database {
           availableAt: now,
           leaseExpiresAt: null,
           leasedBeforeClaim: false,
+          waitingForDaemonId: null,
         });
       }
     }
@@ -977,8 +1051,11 @@ class MemoryDatabase implements Database {
           run.status !== "running" &&
           run.terminalNotificationPendingAt !== null &&
           run.terminalNotificationDeliveredAt === null &&
+          run.terminalNotificationAbandonedAt === null &&
           (run.terminalNotificationLeaseExpiresAt === null ||
-            run.terminalNotificationLeaseExpiresAt <= now),
+            run.terminalNotificationLeaseExpiresAt <= now) &&
+          (run.terminalNotificationNextAttemptAt === null ||
+            run.terminalNotificationNextAttemptAt <= now),
       )
       .sort((left, right) => {
         const time =
@@ -990,9 +1067,47 @@ class MemoryDatabase implements Database {
     const updated = {
       ...candidate,
       terminalNotificationLeaseExpiresAt: new Date(now.getTime() + leaseMs),
+      terminalNotificationAttempts: candidate.terminalNotificationAttempts + 1,
     };
     this.triggerRuns.set(updated.id, updated);
     return updated;
+  }
+
+  async retryWorkflowRunTerminalNotification(triggerRunId: string, nextAttemptAt: Date) {
+    const run = this.undeliveredTerminalNotification(triggerRunId);
+    if (run === undefined) return;
+    this.triggerRuns.set(run.id, {
+      ...run,
+      terminalNotificationLeaseExpiresAt: null,
+      terminalNotificationNextAttemptAt: nextAttemptAt,
+    });
+  }
+
+  async abandonWorkflowRunTerminalNotification(triggerRunId: string, abandonedAt: Date) {
+    const run = this.undeliveredTerminalNotification(triggerRunId);
+    if (run === undefined) return;
+    this.triggerRuns.set(run.id, {
+      ...run,
+      terminalNotificationLeaseExpiresAt: null,
+      terminalNotificationNextAttemptAt: null,
+      terminalNotificationAbandonedAt: abandonedAt,
+    });
+  }
+
+  private undeliveredTerminalNotification(
+    triggerRunId: string,
+  ): AcceptedTriggerRunRecord | undefined {
+    const run = this.triggerRuns.get(triggerRunId);
+    if (
+      run === undefined ||
+      run.outcome !== "accepted" ||
+      run.terminalNotificationPendingAt === null ||
+      run.terminalNotificationDeliveredAt !== null ||
+      run.terminalNotificationAbandonedAt !== null
+    ) {
+      return undefined;
+    }
+    return run;
   }
 
   async markWorkflowRunTerminalNotificationDelivered(
@@ -2613,20 +2728,9 @@ class MemoryDatabase implements Database {
     return revision?.triggerId === triggerId ? revision : undefined;
   }
 
-  async findOrganizationTriggerMigrationRevision(
-    triggerId: string,
-  ): Promise<OrganizationTriggerRevisionRecord | undefined> {
-    return Array.from(this.organizationTriggerRevisions.values())
-      .filter(
-        (revision) =>
-          revision.triggerId === triggerId && revision.sourceKind === "project_migration",
-      )
-      .sort((left, right) => left.version - right.version)[0];
-  }
-
   async saveOrganizationTrigger(
     input: SaveOrganizationTriggerInput,
-  ): Promise<OrganizationTriggerRecord> {
+  ): Promise<SavedOrganizationTrigger> {
     const existing =
       input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
     if (existing !== undefined && existing.organizationId !== input.organizationId) {
@@ -2709,7 +2813,7 @@ class MemoryDatabase implements Database {
           input.name,
       })),
     );
-    return trigger;
+    return { trigger };
   }
 
   private createTriggerRuntimeProject(input: {
@@ -2782,6 +2886,24 @@ class MemoryDatabase implements Database {
     return this.operatorOrganizations().find((organization) => organization.slug === slug);
   }
 
+  /** The in-memory store keeps no user records, so a fixture membership's user id stands in for
+   * the member's name and email. */
+  async listOrganizationMembersForOperator(
+    organizationId: string,
+  ): Promise<OperatorMemberRecord[]> {
+    const joinedAt = this.options.now?.() ?? new Date();
+    return (this.options.memberships ?? [])
+      .filter((membership) => membership.organizationId === organizationId)
+      .map((membership) => ({
+        id: membership.membershipId,
+        userId: membership.userId,
+        name: membership.userId,
+        email: membership.userId,
+        role: membership.role,
+        joinedAt,
+      }));
+  }
+
   async findOrganizationSlugById(organizationId: string): Promise<string | undefined> {
     return this.operatorOrganizations().find((organization) => organization.id === organizationId)
       ?.slug;
@@ -2791,11 +2913,13 @@ class MemoryDatabase implements Database {
    * organizations only through those, so the operator picker reads the same source. */
   private operatorOrganizations(): OperatorOrganizationRecord[] {
     const seen = new Map<string, OperatorOrganizationRecord>();
+    const createdAt = this.options.now?.() ?? new Date();
     for (const membership of this.options.memberships ?? []) {
       seen.set(membership.organizationId, {
         id: membership.organizationId,
         name: membership.organizationName,
         slug: membership.organizationSlug,
+        createdAt,
       });
     }
     return Array.from(seen.values()).sort((left, right) => left.name.localeCompare(right.name));
@@ -3144,92 +3268,6 @@ class MemoryDatabase implements Database {
             },
           ];
     });
-  }
-
-  async listUnroutedProviderEventsForOrganization(organizationId: string) {
-    const routedReceiptIds = new Set(
-      [...this.triggerRuns.values()].map((run) => run.providerEventReceiptId),
-    );
-    return [...this.providerEventReceipts.values()]
-      .filter(
-        (receipt) =>
-          receipt.organizationId === organizationId &&
-          receipt.droppedReason !== null &&
-          isProviderEventDropReasonCode(receipt.droppedReason) &&
-          !routedReceiptIds.has(receipt.id),
-      )
-      .sort(
-        (left, right) =>
-          right.receivedAt.getTime() - left.receivedAt.getTime() || right.id.localeCompare(left.id),
-      )
-      .slice(0, 50)
-      .map(toProviderEventReceiptRecordSummary);
-  }
-
-  async listOrganizationRunsSince(
-    organizationId: string,
-    since: Date,
-    limit: number,
-  ): Promise<OrganizationRunRecord[]> {
-    return [...this.triggerRuns.values()]
-      .filter((run) => run.organizationId === organizationId && run.createdAt >= since)
-      .sort(
-        (left, right) =>
-          right.createdAt.getTime() - left.createdAt.getTime() || right.id.localeCompare(left.id),
-      )
-      .slice(0, limit)
-      .flatMap((run) => {
-        const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
-        if (receipt === undefined) return [];
-        const step = this.listSteps(run.id).find(
-          (candidate) => candidate.agentExecutionId !== null,
-        );
-        const execution =
-          step?.agentExecutionId == null
-            ? undefined
-            : this.agentExecutions.get(step.agentExecutionId);
-        const trigger = Array.from(this.organizationTriggers.values()).find(
-          ({ runtimeProjectId }) => runtimeProjectId === run.projectId,
-        );
-        return [
-          {
-            id: run.id,
-            triggerName: trigger?.name ?? run.configuredTriggerName,
-            provider: receipt.provider,
-            source: receipt.source,
-            status: run.status,
-            receivedAt: receipt.receivedAt,
-            agent: launchedAgent(execution?.launchIntent?.agent),
-          },
-        ];
-      });
-  }
-
-  async countUnroutedProviderEventsSince(
-    organizationId: string,
-    since: Date,
-  ): Promise<UnroutedProviderEventCount[]> {
-    const routedReceiptIds = new Set(
-      [...this.triggerRuns.values()].map((run) => run.providerEventReceiptId),
-    );
-    const counts = new Map<ProviderEventReceiptRecord["provider"], number>();
-    for (const receipt of this.providerEventReceipts.values()) {
-      if (
-        receipt.organizationId !== organizationId ||
-        receipt.receivedAt < since ||
-        routedReceiptIds.has(receipt.id) ||
-        (receipt.droppedReason !== "no_project_route" &&
-          receipt.droppedReason !== "no_trigger_for_source")
-      ) {
-        continue;
-      }
-      counts.set(receipt.provider, (counts.get(receipt.provider) ?? 0) + 1);
-    }
-    return [...counts.entries()]
-      .map(([provider, count]) => ({ provider, count }))
-      .sort(
-        (left, right) => right.count - left.count || left.provider.localeCompare(right.provider),
-      );
   }
 
   async isOrganizationMember(): Promise<boolean> {

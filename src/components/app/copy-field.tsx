@@ -1,4 +1,4 @@
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, Link2 } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { Button } from "../ui/button.js";
@@ -14,13 +14,13 @@ type CopyState = "idle" | "copied" | "manual";
  * of the button never changes — the confirmation is announced in a live region instead, so a
  * screen reader hears "Copied Callback URL" without the button renaming itself under the user.
  */
-function useCopy(label: string, value: string) {
+function useCopy(label: string, read: () => string) {
   const [state, setState] = useState<CopyState>("idle");
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
   useEffect(() => () => clearTimeout(timer.current), []);
   const copy = useCallback(() => {
     clearTimeout(timer.current);
-    const write = navigator.clipboard?.writeText(value);
+    const write = navigator.clipboard?.writeText(read());
     if (write === undefined) {
       setState("manual");
       return;
@@ -34,7 +34,7 @@ function useCopy(label: string, value: string) {
         return true;
       })
       .catch(() => setState("manual"));
-  }, [value]);
+  }, [read]);
   const announcement = state === "copied" ? `Copied ${label}` : "";
   return { state, copy, announcement };
 }
@@ -57,7 +57,9 @@ function CopyControl({
       variant="ghost"
       size={children === undefined ? "icon-sm" : "sm"}
       aria-label={children === undefined ? label : undefined}
-      className="shrink-0"
+      // A labelled ghost button is seen by its text, so its padding hangs past the trailing edge
+      // to put that text on the same rail as the bordered controls above and below it.
+      className={children === undefined ? "shrink-0" : "-mr-2 shrink-0"}
       onClick={onCopy}
     >
       {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
@@ -85,13 +87,40 @@ function Announcement({ message }: { message: string }) {
  * `CopyField` draws would be a second copy of what the reader is already looking at.
  */
 export function CopyButton({ label, value }: { label: string; value: string }) {
-  const { state, copy, announcement } = useCopy(label, value);
+  const read = useCallback(() => value, [value]);
+  const { state, copy, announcement } = useCopy(label, read);
   return (
     <>
       <CopyControl label={`Copy ${label}`} copied={state === "copied"} onCopy={copy} />
       <Announcement message={announcement} />
     </>
   );
+}
+
+/**
+ * Copy the address of this view as it stands: its filters, its sort, and the open record. The
+ * address is read when the button is pressed, so it follows a reader who stepped to another
+ * record. When the browser blocks the clipboard, the address bar still holds the value, so the
+ * fallback points there.
+ */
+export function CopyPageLink() {
+  const { state, copy, announcement } = useCopy("link", readPageAddress);
+  return (
+    <>
+      <Button type="button" size="sm" variant="outline" onClick={copy}>
+        {state === "copied" ? <Check aria-hidden="true" /> : <Link2 aria-hidden="true" />}
+        Copy link
+      </Button>
+      {state === "manual" ? (
+        <span className="text-xs text-muted-foreground">Copy the address from the browser</span>
+      ) : null}
+      <Announcement message={announcement} />
+    </>
+  );
+}
+
+function readPageAddress(): string {
+  return window.location.href;
 }
 
 /**
@@ -133,14 +162,21 @@ export function CopyField({
   value,
   copyLabel,
   focusOnMount = false,
+  labelHidden = false,
 }: {
   label: string;
   value: string;
+  /**
+   * Keep the label for assistive technology only, when the text right above the field already
+   * says what the value is — a checklist step whose title and hint introduce its command.
+   */
+  labelHidden?: boolean;
   /** The copy button's accessible name, when "Copy <label>" is not what it should say. */
   copyLabel?: string;
   focusOnMount?: boolean;
 }) {
-  const { state, copy, announcement } = useCopy(label, value);
+  const read = useCallback(() => value, [value]);
+  const { state, copy, announcement } = useCopy(label, read);
   const id = useId();
   const text = useRef<HTMLSpanElement>(null);
   const field = useRef<HTMLInputElement>(null);
@@ -170,7 +206,9 @@ export function CopyField({
   }, [copy, select]);
   return (
     <Field className="min-w-0 gap-2">
-      <FieldLabel htmlFor={id}>{label}</FieldLabel>
+      <FieldLabel htmlFor={id} className={labelHidden ? "sr-only" : undefined}>
+        {label}
+      </FieldLabel>
       {/*
         The box is the control, so the box carries the ring: the input inside it is borderless
         and drawing a 2px-offset outline around it would land the ring inside the border it is
@@ -199,7 +237,7 @@ export function CopyField({
         />
       </div>
       {state === "manual" ? (
-        <FieldDescription>Select the value and copy it.</FieldDescription>
+        <FieldDescription>Select the value and copy it</FieldDescription>
       ) : null}
       <Announcement message={announcement} />
     </Field>
@@ -214,13 +252,17 @@ export function CopyBlock({
   label,
   value,
   action,
+  description,
 }: {
   label: string;
   value: string;
   /** The visible button text, e.g. "Copy manifest". */
   action: string;
+  /** What the reader has to change in the value before it works, under the block. */
+  description?: string;
 }) {
-  const { state, copy, announcement } = useCopy(label, value);
+  const read = useCallback(() => value, [value]);
+  const { state, copy, announcement } = useCopy(label, read);
   return (
     <Field className="min-w-0 gap-2">
       <div className="flex items-center justify-between gap-2">
@@ -230,8 +272,9 @@ export function CopyBlock({
         </CopyControl>
       </div>
       <CodeBlock label={`${label} value`}>{value}</CodeBlock>
+      {description === undefined ? null : <FieldDescription>{description}</FieldDescription>}
       {state === "manual" ? (
-        <FieldDescription>Select the value and copy it.</FieldDescription>
+        <FieldDescription>Select the value and copy it</FieldDescription>
       ) : null}
       <Announcement message={announcement} />
     </Field>

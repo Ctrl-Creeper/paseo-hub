@@ -1,3 +1,5 @@
+import { createExecutionLauncher } from "./agent-executions/launcher.js";
+import { createWebhookProvider, handleWebhookDelivery } from "./triggers/webhook/index.js";
 import { createScheduleSource, createScheduleProvider } from "./triggers/schedule/index.js";
 import { createExecutionCapabilityServer } from "./execution-capabilities/server.js";
 import { OutputExecutorRegistry } from "./execution-capabilities/outputs.js";
@@ -28,6 +30,7 @@ import {
   updateDaemonPermissions,
   type DaemonClock,
   type DaemonConnection,
+  type DaemonConnections,
   type DaemonModule,
 } from "./daemons/index.js";
 import { createDispatcherWithEngine } from "./dispatcher/index.js";
@@ -44,7 +47,7 @@ import {
 } from "./triggers/manual/source.js";
 import { createManualRunProvider } from "./triggers/manual/provider.js";
 import { OrganizationTriggerStore } from "./triggers/store.js";
-import { DaemonRegistration } from "./daemons/registration.js";
+import { DaemonRegistration, type OrganizationDaemonScope } from "./daemons/registration.js";
 import { CliAuthorizations } from "./cli-authorizations/index.js";
 import type { BrowserOrganizationAccess } from "./auth/browser-organization-access.js";
 import { createPublicApi, type PublicApi, type PublicApiComposition } from "./public-api/index.js";
@@ -54,6 +57,7 @@ import type { EntitlementsService } from "./entitlements/service.js";
 import type { ExecutionAuthority } from "./execution-authority/index.js";
 
 export interface HubRuntimeOptions {
+  integrationTools?: import("./integration-tools/index.js").IntegrationToolHandlers;
   database: Database | null;
   /** Required end to end so the executions meter can never be silently skipped. */
   entitlements: EntitlementsService | null;
@@ -71,7 +75,8 @@ export interface HubRuntimeOptions {
   executionDeadlineClock?: ExecutionDeadlineClock;
   dispatchTimeoutMs?: number;
   browserOrganizationAccess?: BrowserOrganizationAccess;
-  daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
+  /** Replaces the process's own daemon registry as the source of live daemon connections. */
+  daemonConnections?: DaemonConnections;
 }
 
 export interface HubRuntime {
@@ -96,16 +101,24 @@ export interface HubOperations {
   handleCliAuthorizationPoll(request: Request): Promise<Response>;
   handleCliAuthorizationInspect(request: Request): Promise<Response>;
   handleCliAuthorizationDecision(request: Request): Promise<Response>;
-  handleOrganizationDaemons(request: Request): Promise<Response>;
-  handleOrganizationDaemonRename(request: Request, daemonId: string): Promise<Response>;
-  handleOrganizationDaemonRevocation(request: Request, daemonId: string): Promise<Response>;
+  handleOrganizationDaemons(request: Request, organizationSlug: string): Promise<Response>;
+  handleOrganizationDaemonRename(
+    request: Request,
+    input: OrganizationDaemonScope & { slug: string },
+  ): Promise<Response>;
+  handleOrganizationDaemonRevocation(
+    request: Request,
+    input: OrganizationDaemonScope,
+  ): Promise<Response>;
   handleSessionCapabilities(request: Request, sessionId: string): Promise<Response>;
   handleExecutionCapabilities(request: Request, executionId: string): Promise<Response>;
+  handleExecutionLauncher(request: Request, executionId: string): Promise<Response>;
   handleAttachmentDownload(
     request: Request,
     executionId: string,
     attachmentId: string,
   ): Promise<Response>;
+  handleWebhookDelivery(request: Request, endpointId: string): Promise<Response>;
   handleManualTrigger(request: Request, entrypoint: "trigger" | "smoke"): Promise<Response>;
 }
 
@@ -114,6 +127,19 @@ export interface HubApplication {
   operations: HubOperations;
   publicApi: PublicApi;
   configurationForProject(projectId: string): ProjectConfigurationStore;
+}
+
+/** Without a database there is no daemon registry, so no daemon is connected. */
+const NO_DAEMON_CONNECTIONS: DaemonConnections = {
+  connection: () => undefined,
+  dispatchableDaemonIds: () => [],
+};
+
+function appDaemonConnections(
+  options: HubRuntimeOptions,
+  daemons: ActiveDaemonRegistry | null,
+): DaemonConnections {
+  return options.daemonConnections ?? daemons ?? NO_DAEMON_CONNECTIONS;
 }
 
 export function createHubRuntime(options: HubRuntimeOptions): HubRuntime {
@@ -125,12 +151,12 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     options.database === null
       ? null
       : new ActiveDaemonRegistry(options.database, options.daemonClock);
-  const connectionForDaemon = (daemonId: string) =>
-    options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId);
+  const daemonConnections = appDaemonConnections(options, daemons);
+  const connectionForDaemon = (daemonId: string) => daemonConnections.connection(daemonId);
   const agentValidator = createAgentValidator(daemons, connectionForDaemon);
   const storeForProject = (projectId: string) => {
     if (options.database === null) throw new DatabaseUnavailableError();
-    return new ProjectConfigurationStore(options.database, projectId, daemons ?? undefined);
+    return new ProjectConfigurationStore(options.database, projectId, agentValidator ?? undefined);
   };
   const manualProvider =
     options.database === null ? undefined : createManualRunProvider(storeForProject);
@@ -151,12 +177,18 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
         );
   const providers = [
     createScheduleProvider(),
+    createWebhookProvider(),
     manualProvider,
     ...configuredProviders,
     ...(options.providers ?? []),
   ].filter((provider): provider is TriggerProvider => provider !== undefined);
   const outputRegistry = options.outputRegistry ?? new OutputExecutorRegistry();
-  const daemonModule = createAppDaemonModule(options, daemons, providers, outputRegistry);
+  const daemonModule = createAppDaemonModule(
+    options,
+    connectionForDaemon,
+    providers,
+    outputRegistry,
+  );
   const capabilityServer = createAppExecutionCapabilityServer(
     options,
     daemonModule,
@@ -190,8 +222,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       : (intent: Parameters<DaemonModule["lifecycle"]["handoffLaunchMachineIntent"]>[0]) =>
           daemonModule.lifecycle.handoffLaunchMachineIntent(intent);
   const dispatcherOptions = {
-    canDispatchToDaemon: (daemonId: string) =>
-      (options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId)) !== undefined,
+    dispatchableDaemonIds: () => daemonConnections.dispatchableDaemonIds(),
     database: options.database,
     entitlements: options.entitlements,
     providers,
@@ -297,12 +328,12 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       cliAuthorizations === null ? databaseUnavailable() : cliAuthorizations.inspect(request),
     handleCliAuthorizationDecision: (request) =>
       cliAuthorizations === null ? databaseUnavailable() : cliAuthorizations.decide(request),
-    handleOrganizationDaemons: (request) =>
-      registration === null ? databaseUnavailable() : registration.list(request),
-    handleOrganizationDaemonRename: (request, daemonId) =>
-      registration === null ? databaseUnavailable() : registration.rename(request, daemonId),
-    handleOrganizationDaemonRevocation: (request, daemonId) =>
-      registration === null ? databaseUnavailable() : registration.revoke(request, daemonId),
+    handleOrganizationDaemons: (request, organizationSlug) =>
+      registration === null ? databaseUnavailable() : registration.list(request, organizationSlug),
+    handleOrganizationDaemonRename: (request, input) =>
+      registration === null ? databaseUnavailable() : registration.rename(request, input),
+    handleOrganizationDaemonRevocation: (request, input) =>
+      registration === null ? databaseUnavailable() : registration.revoke(request, input),
     handleSessionCapabilities: (request, sessionId) =>
       capabilityServer === null
         ? databaseUnavailable()
@@ -311,10 +342,23 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       capabilityServer === null
         ? databaseUnavailable()
         : capabilityServer.handle(request, executionId),
+    handleExecutionLauncher: createExecutionLauncher(
+      options.database,
+      options.browserOrganizationAccess,
+    ),
     handleAttachmentDownload: (request, executionId, attachmentId) =>
       attachments === undefined
         ? databaseUnavailable()
         : attachments.handle(request, executionId, attachmentId),
+    handleWebhookDelivery: (request, endpointId) =>
+      options.database === null || options.entitlements === null
+        ? databaseUnavailable()
+        : handleWebhookDelivery(
+            request,
+            endpointId,
+            options.database.webhooks,
+            options.entitlements,
+          ),
     handleManualTrigger: (request, entrypoint) =>
       manualSource === undefined
         ? databaseUnavailable()
@@ -333,8 +377,8 @@ function createAgentValidator(
 ): DaemonAgentConfigurationValidator | null {
   if (daemons === null) return null;
   return {
-    validateAgentConfiguration: (daemonId, agent) =>
-      connectionForDaemon(daemonId)?.validateAgentConfiguration(agent) ??
+    validateAgentConfiguration: ({ daemonId, cwd }, agent) =>
+      connectionForDaemon(daemonId)?.validateAgentConfiguration(agent, { cwd }) ??
       Promise.reject(new Error("daemon_not_connected")),
   };
 }
@@ -355,6 +399,7 @@ function createAppPublicOperations(
       triggerForOrganization: (organizationId) => {
         const store = new OrganizationTriggerStore(database, organizationId, daemonAgentValidator);
         return {
+          rotateWebhookSecret: (triggerId) => database.webhooks.rotate(organizationId, triggerId),
           async list() {
             return Promise.all(
               (await store.list()).map(async (trigger) => ({
@@ -375,7 +420,7 @@ function createAppPublicOperations(
             const existing = (await store.list()).find(
               ({ name }) => name === prepared.compiled.authored.name,
             );
-            const trigger = await store.save({
+            const { trigger } = await store.save({
               ...(existing === undefined ? {} : { triggerId: existing.id }),
               yaml: input.yaml,
               userId: null,
@@ -422,7 +467,11 @@ function createAppExecutionCapabilityServer(
       ? {}
       : { completionTokenSecret: options.completionTokenSecret }),
     database: options.database,
+    ...(options.publicBaseUrl === undefined ? {} : { publicBaseUrl: options.publicBaseUrl }),
     outputs: outputRegistry,
+    ...(options.integrationTools === undefined
+      ? {}
+      : { integrationTools: options.integrationTools }),
     completeExecution: (input) =>
       daemonModule.lifecycle.completeAgentExecutionFromCallback(input, { deferHubAction: true }),
   });
@@ -465,7 +514,7 @@ function connectDaemonLifecycle(
 
 function createAppDaemonModule(
   options: HubRuntimeOptions,
-  daemons: ActiveDaemonRegistry | null,
+  connectionForDaemon: DaemonDispatchLifecycleOptions["connectionForDaemon"],
   providers: readonly TriggerProvider[],
   outputRegistry: OutputExecutorRegistry,
 ): DaemonModule | null {
@@ -477,7 +526,7 @@ function createAppDaemonModule(
     options.executionDeadlineClock !== undefined || options.dispatchTimeoutMs !== undefined;
   return createDaemonModule({
     database: options.database,
-    connectionForDaemon: options.daemonConnectionForId ?? ((id) => daemons?.connection(id)),
+    connectionForDaemon,
     executionCapabilities: outputRegistry,
     ...(options.completionTokenSecret === undefined
       ? {}
