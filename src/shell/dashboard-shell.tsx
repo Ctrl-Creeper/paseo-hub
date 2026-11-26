@@ -148,6 +148,7 @@ function DashboardContent({
 }) {
   const tenant = useOptionalRouteTenant() ?? undefined;
   const instance = useInstanceScope(account.isInstanceOperator);
+  const { wide } = usePageContext();
   return (
     <>
       <AppSidebar
@@ -167,7 +168,7 @@ function DashboardContent({
           />
           {/* The app's one content inset. Screens never pad themselves. */}
           <div className="flex flex-1 flex-col p-4 md:p-8">
-            <Page>
+            <Page wide={wide}>
               <ErrorSummary message={error} />
               <PageContent account={account} tenant={tenant} transitioning={transitioning} />
             </Page>
@@ -374,7 +375,7 @@ const ORGANIZATION_SECTIONS: readonly SectionDestination[] = [
   { section: "triggers", label: "Triggers", icon: Zap, subtree: true },
   { section: "activity", label: "Activity", icon: History },
   { section: "daemons", label: "Daemons", icon: Cpu },
-  { section: "connections", label: "Connections", icon: Cable },
+  { section: "integrations", label: "Integrations", icon: Cable },
   { section: "settings", label: "Settings", icon: Settings, subtree: true },
 ];
 const PROJECT_SECTIONS: readonly SectionDestination[] = [

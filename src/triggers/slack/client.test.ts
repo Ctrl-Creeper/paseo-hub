@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
-import { createSlackBotClient } from "./client.js";
+import { classifyFailure, retryAdvice } from "../../failures/index.js";
+import { createSlackBotClient, SlackApiError } from "./client.js";
 
 describe("Slack Web API client", () => {
   it("looks up an authored username with the workspace bot token", async () => {
@@ -18,8 +19,8 @@ describe("Slack Web API client", () => {
       "operator",
     );
     assert.deepEqual(request, {
-      url: "https://slack.com/api/users.info",
-      method: "POST",
+      url: "https://slack.com/api/users.info?user=U1",
+      method: "GET",
     });
   });
 
@@ -54,7 +55,13 @@ describe("Slack Web API client", () => {
       {
         url: "https://slack.com/api/chat.postMessage",
         authorization: "Bearer xoxb-secret",
-        body: { channel: "C1", thread_ts: "1.1", text: "Hi" },
+        body: {
+          channel: "C1",
+          thread_ts: "1.1",
+          text: "Hi",
+          unfurl_links: false,
+          unfurl_media: false,
+        },
       },
     ]);
 
@@ -71,7 +78,10 @@ describe("Slack Web API client", () => {
           messageTs: "1.1",
           name: "eyes",
         }),
-      /Slack API ratelimited/u,
+      (error: unknown) =>
+        error instanceof SlackApiError &&
+        error.code === "ratelimited" &&
+        error.message === "Slack API ratelimited",
     );
   });
 
@@ -127,6 +137,136 @@ describe("Slack Web API client", () => {
       { name: "TimeoutError" },
     );
     assert.equal(requestSignal?.aborted, true);
+  });
+
+  it("treats a reaction that is already in place, or whose message is gone, as done", async () => {
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async (input) =>
+        Response.json({
+          ok: false,
+          error: requestUrl(input).endsWith("reactions.add") ? "already_reacted" : "no_reaction",
+        }),
+    });
+    const reaction = {
+      organizationId: "org-1",
+      teamId: "T1",
+      channelId: "C1",
+      messageTs: "1.1",
+      name: "white_check_mark",
+    };
+
+    await client.addReaction(reaction);
+    await client.removeReaction(reaction);
+
+    for (const error of ["message_not_found", "channel_not_found"]) {
+      const gone = createSlackBotClient({
+        tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+        fetch: async () => Response.json({ ok: false, error }),
+      });
+      await gone.addReaction(reaction);
+      await gone.removeReaction(reaction);
+    }
+
+    const mismatched = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async (input) =>
+        Response.json({
+          ok: false,
+          error: requestUrl(input).endsWith("reactions.add") ? "no_reaction" : "already_reacted",
+        }),
+    });
+    await assert.rejects(() => mismatched.addReaction(reaction), /Slack API no_reaction/u);
+    await assert.rejects(() => mismatched.removeReaction(reaction), /Slack API already_reacted/u);
+  });
+
+  it("reports an HTTP 429 as ratelimited with the wait Slack asked for", async () => {
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async () =>
+        Response.json(
+          { ok: false, error: "ratelimited" },
+          { status: 429, headers: { "retry-after": "30" } },
+        ),
+    });
+
+    const error = await client
+      .addReaction({
+        organizationId: "org-1",
+        teamId: "T1",
+        channelId: "C1",
+        messageTs: "1.1",
+        name: "white_check_mark",
+      })
+      .then(
+        () => undefined,
+        (rejection: unknown) => rejection,
+      );
+
+    assert.ok(error instanceof SlackApiError);
+    assert.equal(error.code, "ratelimited");
+    assert.equal(classifyFailure(error), "rateLimited");
+    assert.deepEqual(retryAdvice(error), { retryable: true, retryAfterMs: 30_000 });
+  });
+
+  it.each([
+    ["not_in_channel", false],
+    ["missing_scope", false],
+    ["invalid_auth", false],
+    ["account_inactive", false],
+    ["token_revoked", false],
+    ["is_archived", false],
+    ["internal_error", true],
+    ["fatal_error", true],
+  ] as const)("tells a caller whether Slack's %s can succeed on retry", async (code, retryable) => {
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async () => Response.json({ ok: false, error: code }),
+    });
+
+    const error = await client
+      .sendMessage({
+        organizationId: "org-1",
+        teamId: "T1",
+        channelId: "C1",
+        threadTs: "1.1",
+        content: "done",
+      })
+      .then(
+        () => undefined,
+        (rejection: unknown) => rejection,
+      );
+
+    assert.ok(error instanceof SlackApiError);
+    assert.equal(retryAdvice(error).retryable, retryable);
+  });
+
+  it("does not retry a call for a workspace that is no longer connected", async () => {
+    let requested = false;
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve(undefined),
+      fetch: async () => {
+        requested = true;
+        return Response.json({ ok: true });
+      },
+    });
+
+    const error = await client
+      .addReaction({
+        organizationId: "org-1",
+        teamId: "T1",
+        channelId: "C1",
+        messageTs: "1.1",
+        name: "white_check_mark",
+      })
+      .then(
+        () => undefined,
+        (rejection: unknown) => rejection,
+      );
+
+    assert.equal(requested, false);
+    assert.match(String(error), /Slack workspace is not connected/u);
+    assert.deepEqual(retryAdvice(error), { retryable: false });
   });
 
   it("keeps the root with the latest 49 preceding Slack replies, oldest first", async () => {
@@ -265,7 +405,7 @@ describe("Slack Web API client", () => {
           url: requestUrl(input),
           authorization: new Headers(init?.headers).get("authorization"),
         });
-        if (requestUrl(input).endsWith("files.info")) {
+        if (requestUrl(input).startsWith("https://slack.com/api/files.info?")) {
           return Response.json({
             ok: true,
             file: {
@@ -288,12 +428,32 @@ describe("Slack Web API client", () => {
 
     assert.equal(await response?.text(), "slack-image-bytes");
     assert.deepEqual(requests, [
-      { url: "https://slack.com/api/files.info", authorization: "Bearer xoxb-secret" },
+      { url: "https://slack.com/api/files.info?file=F1", authorization: "Bearer xoxb-secret" },
       {
         url: "https://files.slack.com/files-pri/T1-F1/download/image.png",
         authorization: "Bearer xoxb-secret",
       },
     ]);
+  });
+
+  it("throws SlackApiError with Slack's error code when files.info fails", async () => {
+    const client = createSlackBotClient({
+      tokenForWorkspace: () => Promise.resolve("xoxb-secret"),
+      fetch: async () => Response.json({ ok: false, error: "file_not_found" }),
+    });
+
+    await assert.rejects(
+      () =>
+        client.downloadAttachment!({
+          organizationId: "org-1",
+          teamId: "T1",
+          fileId: "F-missing",
+        }),
+      (error: unknown) =>
+        error instanceof SlackApiError &&
+        error.code === "file_not_found" &&
+        error.message === "Slack API file_not_found",
+    );
   });
 });
 

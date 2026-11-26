@@ -1,6 +1,7 @@
 import { expect, type Locator, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { DaemonHandoffSurface } from "./daemon-handoff.js";
+import { GitHubConnectFlow, type GitHubAccountChoice } from "./github.js";
 
 export type AppProvider = "GitHub" | "Slack" | "Discord" | "Linear";
 
@@ -20,10 +21,10 @@ const PORTAL_LINKS: Readonly<Record<AppProvider, string>> = {
 };
 
 const APP_SUMMARIES: Readonly<Record<AppProvider, string>> = {
-  GitHub: "Reads issues and pull requests, and lets agents push.",
-  Slack: "Reads mentions in your workspace and replies in the thread.",
-  Discord: "Reads mentions in your server and replies in the thread.",
-  Linear: "Starts project-scoped workflows from issues and posts outcomes back to Linear.",
+  GitHub: "Reads issues and pull requests, and lets agents push",
+  Slack: "Reads mentions in your workspace and replies in the thread",
+  Discord: "Reads mentions in your server and replies in the thread",
+  Linear: "Starts project-scoped workflows from issues and posts outcomes back to Linear",
 };
 
 /**
@@ -205,6 +206,27 @@ export class AppSection {
     return this.body().getByRole("button", { name, exact: true });
   }
 
+  /** Presses Connect GitHub and connects one account across GitHub's pages and Hub's chooser. */
+  async connectGitHub(account = "acme-inc"): Promise<void> {
+    const github = new GitHubConnectFlow(this.page);
+    await this.action("Connect GitHub").click();
+    await github.connect(account);
+  }
+
+  /** Presses Connect GitHub and connects an account that already has the App, from the chooser. */
+  async connectFromGitHubChooser(
+    account: string,
+    choices: readonly GitHubAccountChoice[],
+  ): Promise<void> {
+    const github = new GitHubConnectFlow(this.page);
+    await this.action("Connect GitHub").click();
+    await github.authorizeWhenAsked();
+    await github.expectChooser(choices);
+    await github.choose(account);
+    await expect(this.page).not.toHaveURL((url) => url.pathname.startsWith("/integrations"));
+    github.expectInstallPageNotVisited();
+  }
+
   async save(): Promise<void> {
     await this.body()
       .getByRole("button", {
@@ -272,7 +294,7 @@ export class AppSection {
     await this.expectExpanded();
     await expect(this.body().getByRole("alert")).toContainText("HTTPS required");
     await expect(this.body().getByRole("alert")).toContainText(
-      `Slack only works over HTTPS, and Hub is at ${origin}. Reopen Hub at its public HTTPS address to set up Slack.`,
+      `Slack only works over HTTPS, and Hub is at ${origin}. Reopen Hub at its public HTTPS address to set up Slack`,
     );
     await expect(this.body().getByRole("link", { name: "Create a Slack app" })).toHaveCount(0);
     await expect(this.body().getByRole("list")).toHaveCount(0);
@@ -286,7 +308,7 @@ export class AppSection {
     await this.expectExpanded();
     await expect(this.body().getByRole("alert")).toContainText("HTTPS required");
     await expect(this.body().getByRole("alert")).toContainText(
-      `Linear webhooks need HTTPS, and Hub is at ${origin}. Reopen Hub at its public HTTPS address to set up Linear.`,
+      `Linear webhooks need HTTPS, and Hub is at ${origin}. Reopen Hub at its public HTTPS address to set up Linear`,
     );
     await expect(
       this.body().getByRole("link", { name: "Open Linear API applications" }),
@@ -489,7 +511,7 @@ export class AppSetupSurface {
     await expect(this.page.getByRole("heading", { name: "Set up your apps" })).toBeVisible();
     await expect(
       this.page.getByText(
-        "Paseo Hub talks to GitHub, Slack, Discord, and Linear through apps you create and own.",
+        "Paseo Hub talks to GitHub, Slack, Discord, and Linear through apps you create and own",
         { exact: false },
       ),
     ).toBeVisible();
@@ -500,7 +522,7 @@ export class AppSetupSurface {
     await expect(this.page.getByRole("heading", { name: "Apps", exact: true })).toBeVisible();
     await expect(
       this.page.getByText(
-        "The GitHub, Slack, Discord, and Linear apps Hub uses to reach your workspaces.",
+        "GitHub, Slack, Discord, and Linear apps Hub uses to reach your workspaces",
       ),
     ).toBeVisible();
   }

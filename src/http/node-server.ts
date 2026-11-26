@@ -1,6 +1,11 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type RequestListener,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { once } from "node:events";
 import { isIP } from "node:net";
 import type { Logger } from "pino";
 import { logger as defaultLogger } from "../logger.js";
@@ -20,42 +25,55 @@ interface StreamingRequestInit extends RequestInit {
   duplex: "half";
 }
 
-interface FetchServerOptions {
+export interface FetchRequestOptions {
   trustedClientIpHeader?: string;
   /** Explicit public URL whose origin is authoritative over proxy request metadata. */
   canonicalRequestOrigin?: string;
+  logger?: Pick<Logger, "warn" | "error">;
+}
+
+interface FetchServerOptions extends FetchRequestOptions {
   /** Test and embedded adapters may terminate TLS directly; production normally uses its proxy. */
   tls?: { key: string; cert: string };
-  logger?: Pick<Logger, "warn" | "error">;
 }
 
 export function createFetchServer(
   fetchHandler: FetchHandler,
   options: FetchServerOptions = {},
 ): Server {
+  const { tls, ...requestOptions } = options;
+  const listener = createFetchRequestListener(fetchHandler, requestOptions);
+  return tls === undefined ? createServer(listener) : createHttpsServer(tls, listener);
+}
+
+/** Answers each Node request by forwarding it to a fetch handler. */
+export function createFetchRequestListener(
+  fetchHandler: FetchHandler,
+  options: FetchRequestOptions = {},
+): RequestListener {
   const resolvedOptions = {
     ...options,
     ...(options.canonicalRequestOrigin === undefined
       ? {}
       : { canonicalRequestOrigin: parseHttpOrigin(options.canonicalRequestOrigin) }),
   };
-  const handler = (request: IncomingMessage, response: ServerResponse) => {
+  return (request, response) => {
     void forwardRequest(fetchHandler, request, response, resolvedOptions);
   };
-  return resolvedOptions.tls === undefined
-    ? createServer(handler)
-    : createHttpsServer(resolvedOptions.tls, handler);
 }
 
 async function forwardRequest(
   fetchHandler: FetchHandler,
   incoming: IncomingMessage,
   outgoing: ServerResponse,
-  options: FetchServerOptions,
+  options: FetchRequestOptions,
 ): Promise<void> {
   try {
     const clientAddress = resolveClientAddress(incoming, options.trustedClientIpHeader);
-    const request = toRequest(incoming, clientAddress, options);
+    const request = toRequest(incoming, clientAddress, options, () => {
+      // Let the client read the response before closing a connection with an unread body.
+      outgoing.shouldKeepAlive = false;
+    });
     const tracked = await runWithFailureTracking(async () => {
       const response = await fetchHandler(request);
       return { response, failureReported: failureWasReported() };
@@ -124,11 +142,20 @@ async function forwardRequest(
       return;
     }
     const reader = response.body.getReader();
+    // A client that disconnects never reads again: release a streamed body
+    // (an MCP SSE exchange holds its server open until then) instead of
+    // waiting for the next chunk or for a drain that will not come.
+    const cancelBody = (): void => {
+      if (!outgoing.writableFinished) void reader.cancel().catch(() => {});
+    };
+    if (outgoing.destroyed) cancelBody();
+    else outgoing.once("close", cancelBody);
     for (;;) {
       const chunk = await reader.read();
-      if (chunk.done) break;
-      if (!outgoing.write(chunk.value)) await once(outgoing, "drain");
+      if (chunk.done || outgoing.destroyed) break;
+      if (!outgoing.write(chunk.value)) await drainOrClose(outgoing);
     }
+    if (outgoing.destroyed) return;
     responseForwarded = true;
     outgoing.end();
   } catch (error) {
@@ -161,6 +188,18 @@ async function forwardRequest(
   }
 }
 
+function drainOrClose(outgoing: ServerResponse): Promise<void> {
+  return new Promise((resolve) => {
+    const settle = (): void => {
+      outgoing.off("drain", settle);
+      outgoing.off("close", settle);
+      resolve();
+    };
+    outgoing.once("drain", settle);
+    outgoing.once("close", settle);
+  });
+}
+
 function safeRequestPath(value: string | undefined): string {
   if (value === undefined) return "/";
   try {
@@ -173,7 +212,8 @@ function safeRequestPath(value: string | undefined): string {
 function toRequest(
   incoming: IncomingMessage,
   clientAddress: string,
-  options: FetchServerOptions,
+  options: FetchRequestOptions,
+  onBodyCancelled: () => void,
 ): Request {
   const method = incoming.method ?? "GET";
   const origin = `http://${incoming.headers.host ?? "localhost"}`;
@@ -186,7 +226,7 @@ function toRequest(
   }
   const streaming = {
     ...base,
-    body: requestBody(incoming),
+    body: requestBody(incoming, onBodyCancelled),
     duplex: "half",
   } satisfies StreamingRequestInit;
   return new Request(new URL(incoming.url ?? "/", origin), streaming);
@@ -204,12 +244,15 @@ function resolveClientAddress(
   return isIP(address) === 0 ? peerAddress : address;
 }
 
-function requestBody(incoming: IncomingMessage): ReadableStream<Uint8Array> {
+function requestBody(
+  incoming: IncomingMessage,
+  onCancelled: () => void,
+): ReadableStream<Uint8Array> {
   let iterator: AsyncIterator<unknown> | undefined;
   const source = {
     type: "bytes",
     async pull(controller) {
-      iterator ??= incoming[Symbol.asyncIterator]();
+      iterator ??= incoming.iterator({ destroyOnReturn: false });
       try {
         const chunk = await iterator.next();
         if (chunk.done) {
@@ -222,8 +265,8 @@ function requestBody(incoming: IncomingMessage): ReadableStream<Uint8Array> {
       }
     },
     async cancel() {
+      onCancelled();
       await iterator?.return?.();
-      incoming.destroy();
     },
   } satisfies UnderlyingByteSource;
   return new ReadableStream(source);
@@ -248,7 +291,7 @@ function requestHeaders(incoming: IncomingMessage): Headers {
   return headers;
 }
 
-function requestOrigin(incoming: IncomingMessage, options: FetchServerOptions): string {
+function requestOrigin(incoming: IncomingMessage, options: FetchRequestOptions): string {
   if (options.canonicalRequestOrigin !== undefined) return options.canonicalRequestOrigin;
   const directProtocol = Reflect.get(incoming.socket, "encrypted") === true ? "https" : "http";
   const directHost = incoming.headers.host;

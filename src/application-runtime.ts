@@ -1,3 +1,4 @@
+import type { IntegrationToolHandlers } from "./integration-tools/index.js";
 import { createHubApplication } from "./app.js";
 import type { AuthServer } from "./auth/server.js";
 import type { BillingRuntime } from "./billing/index.js";
@@ -5,7 +6,7 @@ import type { ConnectionResolver } from "./config/connections.js";
 import type { Database } from "./db/types.js";
 import { resolveRouteTenant } from "./projects/access.js";
 import { capabilitiesFor } from "./auth/organization-policy.js";
-import type { DaemonDispatchLifecycleOptions } from "./daemons/lifecycle.js";
+import type { DaemonConnections } from "./daemons/index.js";
 import type { EntitlementsService } from "./entitlements/service.js";
 import { OperatorConsole } from "./operator/console.js";
 import { UsageDashboard } from "./usage/dashboard.js";
@@ -27,7 +28,8 @@ import { ProjectDashboard } from "./projects/dashboard.js";
 import { CompositionResources } from "./composition-resources.js";
 import { TriggerDashboard } from "./triggers/dashboard.js";
 import type { ProviderApplications } from "./provider-applications/index.js";
-import { DaemonProviderCatalog } from "./daemons/provider-catalog.js";
+import { DaemonCatalog } from "./daemons/catalog.js";
+import { ActivityDashboard } from "./activity/index.js";
 import { HomeDashboard } from "./home/dashboard.js";
 import type { ProviderConnectionRegistration } from "./providers/registration.js";
 
@@ -43,7 +45,7 @@ export interface ApplicationCompositionOptions {
   publicBaseUrl?: string;
   completionTokenSecret?: string;
   testTriggerRoutes?: boolean;
-  daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
+  daemonConnections?: DaemonConnections;
   close(): Promise<void>;
 }
 
@@ -83,9 +85,11 @@ async function createOwnedApplicationRuntime(
     connectionsForProject,
     integrations,
   );
+  const integrationTools: IntegrationToolHandlers = {};
   const outputRegistry = new OutputExecutorRegistry();
-  for (const output of registrations.flatMap((registration) => registration.outputs)) {
-    outputRegistry.register(output);
+  for (const registration of registrations) {
+    for (const output of registration.outputs) outputRegistry.register(output);
+    Object.assign(integrationTools, registration.integrationTools);
   }
 
   const application = createHubApplication({
@@ -111,9 +115,10 @@ async function createOwnedApplicationRuntime(
       ? {}
       : { completionTokenSecret: options.completionTokenSecret }),
     outputRegistry,
-    ...(options.daemonConnectionForId === undefined
+    integrationTools,
+    ...(options.daemonConnections === undefined
       ? {}
-      : { daemonConnectionForId: options.daemonConnectionForId }),
+      : { daemonConnections: options.daemonConnections }),
   });
   ownership.own(() => application.hub.stop());
   await application.hub.start(registrations.flatMap((registration) => registration.sources));
@@ -138,8 +143,9 @@ async function createOwnedApplicationRuntime(
         ? null
         : new ProjectDashboard(options.database, options.auth),
     triggerDashboard: triggerDashboardFor(options, application.hub),
-    daemonProviderCatalog: daemonProviderCatalogFor(options, application.hub),
+    daemonCatalog: daemonCatalogFor(options, application.hub),
     homeDashboard: homeDashboardFor(options, connections),
+    activityDashboard: activityDashboardFor(options),
     ...entitlementSurfaces(options),
     testTriggerRoutes: options.testTriggerRoutes ?? false,
     auth: (request) => {
@@ -344,7 +350,17 @@ function triggerDashboardFor(
 ): TriggerDashboard | null {
   return options.database === null || options.auth === null || hub.agentValidator === null
     ? null
-    : new TriggerDashboard(options.database, options.auth, hub.agentValidator);
+    : new TriggerDashboard(
+        options.database,
+        options.auth,
+        hub.agentValidator,
+        options.publicBaseUrl,
+      );
+}
+
+function activityDashboardFor(options: ApplicationCompositionOptions): ActivityDashboard | null {
+  if (options.database === null || options.auth === null) return null;
+  return new ActivityDashboard(options.database, options.auth);
 }
 
 function homeDashboardFor(
@@ -367,12 +383,12 @@ function isConfigured(status: unknown): boolean {
   );
 }
 
-function daemonProviderCatalogFor(
+function daemonCatalogFor(
   options: ApplicationCompositionOptions,
   hub: import("./app.js").HubRuntime,
-): DaemonProviderCatalog | null {
+): DaemonCatalog | null {
   if (options.database === null || options.auth === null) return null;
-  return new DaemonProviderCatalog(options.database, options.auth, (daemonId) =>
+  return new DaemonCatalog(options.database, options.auth, (daemonId) =>
     hub.connectionForDaemon(daemonId),
   );
 }
@@ -456,9 +472,10 @@ function requireAuth(options: ApplicationCompositionOptions): AuthServer {
 
 /**
  * The two org/instance entitlement surfaces, present together whenever a database, browser auth,
- * and the core entitlements service all exist. Neither depends on billing — Usage renders on
+ * and the core entitlements service all exist. Neither requires billing — Usage renders on
  * self-hosted and hosted alike, and the operator console is gated by its own server-side flag,
- * not by Stripe.
+ * not by Stripe. When billing is mounted the operator console also shows each organization's
+ * plan and Stripe customer.
  */
 function entitlementSurfaces(options: ApplicationCompositionOptions): {
   usageDashboard: UsageDashboard | null;
@@ -470,7 +487,7 @@ function entitlementSurfaces(options: ApplicationCompositionOptions): {
   }
   return {
     usageDashboard: new UsageDashboard(database, auth, entitlements),
-    operatorConsole: new OperatorConsole(database, auth, entitlements),
+    operatorConsole: new OperatorConsole(database, auth, entitlements, options.billing),
   };
 }
 

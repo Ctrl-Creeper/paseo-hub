@@ -4,8 +4,10 @@ import type { Database } from "../../db/types.js";
 import { replyOutputTool } from "../../execution-capabilities/outputs.js";
 import { logger } from "../../logger.js";
 import { reportFailure } from "../../failures/index.js";
+import { IntegrationToolError, type IntegrationToolCall } from "../../integration-tools/index.js";
 import { createDiscordRegistration } from "../../providers/discord/index.js";
 import { createGitHubRegistration } from "../../providers/github/index.js";
+import { GITHUB_CONNECTION_ACTIONS } from "../../providers/github/connection.js";
 import { createLinearRegistration } from "../../providers/linear/index.js";
 import type {
   ProviderRegistration,
@@ -398,6 +400,20 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
         },
       ],
       sources: [source],
+      ...(provider === "slack" || provider === "discord"
+        ? {
+            integrationTools: {
+              [provider]: (input: IntegrationToolCall) => {
+                const active = slot.active;
+                const handler = active?.registration.integrationTools?.[provider];
+                if (active === undefined || handler === undefined) {
+                  throw new IntegrationToolError("The integration is unavailable.");
+                }
+                return this.withLease(active, () => handler(input));
+              },
+            },
+          }
+        : {}),
       outputs: [
         {
           type: `${provider}.reply`,
@@ -553,7 +569,8 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
     action: string,
     request: Request,
   ): Promise<ActiveRegistration | undefined> {
-    if (action !== "callback" && action !== "setup") return slot.active;
+    // An action that continues an attempt carries its state, and belongs to the registration
+    // that started it, even if the operator has saved a new configuration since.
     const state = new URL(request.url).searchParams.get("state");
     if (state === null) return slot.active;
     const snapshot = await this.options.database.findConnectionAttemptConfiguration(
@@ -611,7 +628,7 @@ function emptySlot(): Slot {
 }
 
 function actionNames(provider: Provider): readonly string[] {
-  if (provider === "github") return ["start", "disconnect", "setup", "callback"];
+  if (provider === "github") return GITHUB_CONNECTION_ACTIONS;
   return ["start", "disconnect", "callback"];
 }
 

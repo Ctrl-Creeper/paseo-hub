@@ -1,8 +1,10 @@
 import { RecurrenceSchema } from "../schedule/recurrence.js";
 import { z } from "zod";
+import { IntegrationToolGrantsSchema } from "../../integration-tools/grants.js";
 import { ContinuationSchema } from "../continuation.js";
-import { eventDefinition, isEditorEvent } from "./events.js";
+import { eventDefinition, isEditorEvent, type EditorEvent, type QualifierKey } from "./events.js";
 import { AuthoredGitHubAuthoritySchema } from "../../config/github-authority.js";
+import { GitHubAuthorAssociationSchema } from "../github/author-association.js";
 
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -49,6 +51,8 @@ export const TriggerFilterSchema = z
     assignees: z.array(z.string().min(1)).min(1).optional(),
     channels: z.array(z.string().min(1)).optional(),
     from_users: z.array(z.string().min(1)).optional(),
+    /** GitHub repository associations whose holders may invoke the trigger. */
+    author_associations: z.array(GitHubAuthorAssociationSchema).min(1).optional(),
     inputs: z.record(z.string(), InputValueSchema).optional(),
   })
   .strict();
@@ -109,6 +113,7 @@ export const TriggerRunSchema = z
     startup_timeout: z.string().min(1).optional(),
     env: z.record(z.string().min(1), z.string()).optional(),
     github: AuthoredGitHubAuthoritySchema.optional(),
+    tools: IntegrationToolGrantsSchema.optional(),
     output: z
       .object({ schema: z.record(z.string(), z.unknown()) })
       .strict()
@@ -118,6 +123,28 @@ export const TriggerRunSchema = z
     background: z.boolean().default(false),
   })
   .strict();
+
+/** A qualifier the event declares as required must be present and not blank. */
+function requireQualifiers(
+  event: EditorEvent,
+  definition: {
+    filters?: Partial<Record<QualifierKey, string | readonly string[] | undefined>> | undefined;
+  },
+  context: z.RefinementCtx,
+): void {
+  for (const qualifier of eventDefinition(event).qualifiers) {
+    const value = definition.filters?.[qualifier.key];
+    const blank =
+      value === undefined || (typeof value === "string" ? value.trim() : value).length === 0;
+    if (qualifier.required && blank) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["on", event, "filters", qualifier.key],
+        message: `${qualifier.label} is required.`,
+      });
+    }
+  }
+}
 
 export const TriggerDocumentSchema = z
   .object({
@@ -160,19 +187,9 @@ export const TriggerDocumentSchema = z
           message: "Recurrence is only supported for schedule.tick.",
         });
       }
+      if (event === "webhook.received") validateWebhook(definition, trigger.inputs, context);
       if (!isEditorEvent(event)) continue;
-      for (const qualifier of eventDefinition(event).qualifiers) {
-        const value = definition.filters?.[qualifier.key];
-        const blank =
-          value === undefined || (typeof value === "string" ? value.trim() : value).length === 0;
-        if (qualifier.required && blank) {
-          context.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ["on", event, "filters", qualifier.key],
-            message: `${qualifier.label} is required.`,
-          });
-        }
-      }
+      requireQualifiers(event, definition, context);
     }
     if (Object.keys(trigger.on).length === 0) {
       context.addIssue({
@@ -191,3 +208,25 @@ export const TriggerDocumentSchema = z
   });
 
 export type TriggerDocument = z.infer<typeof TriggerDocumentSchema>;
+
+function validateWebhook(
+  definition: z.infer<typeof TriggerEventSchema>,
+  inputs: TriggerDocument["inputs"],
+  context: z.RefinementCtx,
+): void {
+  if (definition.connection !== undefined || definition.filters !== undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["on", "webhook.received"],
+      message: "Webhook does not accept connection or filters.",
+    });
+  }
+  for (const [name, input] of Object.entries(inputs ?? {})) {
+    if (input.required !== true) continue;
+    context.addIssue({
+      code: "custom",
+      path: ["inputs", name],
+      message: "A webhook cannot supply required trigger inputs.",
+    });
+  }
+}

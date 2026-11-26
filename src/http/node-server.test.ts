@@ -9,9 +9,36 @@ import { createLogger } from "../logger.js";
 import { createPublicApi } from "../public-api/index.js";
 import type { PublicOperations } from "../public-operations/index.js";
 import { createSlackWebhookSource } from "../triggers/slack/webhook.js";
+import { readBoundedRequestBody } from "./request-body.js";
 import { createFetchServer } from "./node-server.js";
 import { registerResponseFinishCleanup } from "./response-lifecycle.js";
 import { TRUSTED_REQUEST_ORIGIN_HEADER } from "./request-origin.js";
+
+it.each(["declared", "streamed"] as const)(
+  "returns 413 over HTTP for oversized %s bodies",
+  async (kind) => {
+    const server = createFetchServer(async (request) => {
+      const body = await readBoundedRequestBody(request, 8);
+      return body instanceof Response ? body : new Response("accepted");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address !== null && typeof address !== "string");
+    try {
+      const init: RequestInit & { duplex: "half" } = {
+        method: "POST",
+        duplex: "half",
+        body: kind === "declared" ? "0123456789" : new Blob(["0123456789"]).stream(),
+      };
+      const response = await fetch(`http://127.0.0.1:${address.port}/`, init);
+      assert.equal(response.status, 413);
+      assert.equal(response.headers.get("connection"), "close");
+      assert.equal(await response.text(), "Payload Too Large");
+    } finally {
+      await closeServer(server);
+    }
+  },
+);
 
 describe("trusted request origin metadata", () => {
   it("overwrites a caller-supplied internal header with direct HTTP metadata", async () => {
@@ -191,6 +218,54 @@ describe("fetch response lifecycle", () => {
   });
 });
 
+describe("streamed responses", () => {
+  // A stateless 2025-era MCP tool call answers over SSE and holds its server
+  // open until the stream ends or is cancelled. A client that disconnects
+  // before the first event must release it, not leave it waiting on a socket
+  // that will never read again.
+  it("cancels the response body when the client disconnects before the first chunk", async () => {
+    let readStarted!: () => void;
+    const bodyRead = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    let bodyCancelled!: () => void;
+    const cancelled = new Promise<void>((resolve) => {
+      bodyCancelled = resolve;
+    });
+    const server = createFetchServer(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull: () => {
+              readStarted();
+              return new Promise<void>(() => {});
+            },
+            cancel: () => bodyCancelled(),
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    );
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address !== null && typeof address !== "string");
+    try {
+      const request = httpRequest({
+        host: "127.0.0.1",
+        port: address.port,
+        path: "/",
+        method: "POST",
+      });
+      request.once("error", () => {});
+      request.end("{}");
+      await bodyRead;
+      request.destroy();
+      await cancelled;
+    } finally {
+      await closeServer(server);
+    }
+  });
+});
+
 describe("HTTP failure ownership", () => {
   it("emits exactly one record for a reported expected 4xx response", async () => {
     const stream = new CaptureStream();
@@ -228,6 +303,7 @@ describe("HTTP failure ownership", () => {
     const failure = new Error("storage exploded with formatless-secret-f09e");
     const failOperation = () => Promise.reject(failure);
     const operations: PublicOperations = {
+      rotateWebhookSecret: failOperation,
       listTriggers: failOperation,
       validateTrigger: failOperation,
       installTrigger: failOperation,

@@ -17,7 +17,7 @@ import type { Locks } from "./db/runtime/locks/index.js";
 import { logger } from "./logger.js";
 import { reportFailure } from "./failures/index.js";
 import { installProcessFailureHandlers } from "./failures/process.js";
-import { createFetchServer } from "./http/node-server.js";
+import { createHubServer } from "./http/hub-server.js";
 import { loadBuiltStartServer } from "./server/build.js";
 import { createAuthServer } from "./auth/server.js";
 import { startApplication, stopApplication, type ApplicationRuntime } from "./server/runtime.js";
@@ -31,6 +31,7 @@ import {
 } from "./billing/index.js";
 import { composeEntitlements, type ComposedEntitlements } from "./auth/entitlements.js";
 import { readInstanceAuthPolicy } from "./auth/instance-policy.js";
+import { readSocialSignIn, type SocialSignIn } from "./auth/social-sign-in.js";
 import { createRuntimeConfiguration } from "./runtime-configuration/index.js";
 import { CompositionResources } from "./composition-resources.js";
 import {
@@ -119,6 +120,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       billing,
       invitationMailer,
       accountMailer,
+      readSocialSignIn(process.env),
     );
     resources.own(() => auth.close());
     await auth.initialize?.();
@@ -164,7 +166,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       completionTokenSecret: identity.authSecret,
       close: () => resources.close(),
     });
-    const activationFailures = await activateProviderApplicationsAtStartup({
+    await activateProviderApplicationsAtStartup({
       store: providerStore,
       environment: providerEnvironment,
       runtime: providerRuntime,
@@ -172,13 +174,6 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       inventory: providerInventory,
       callbackOrigin: identity.appUrl,
     });
-    for (const { provider, error } of activationFailures) {
-      reportFailure(error, {
-        operation: "provider_application.activate_at_startup",
-        component: "provider_applications",
-        provider,
-      });
-    }
     const receiptRetention = new ReceiptRetention(runtime);
     resources.own(() => receiptRetention.stop());
     receiptRetention.start();
@@ -199,6 +194,7 @@ function createProductionAuthServer(
   billing: BillingRuntime | null,
   invitationMailer: ReturnType<typeof createInvitationMailer> | undefined,
   accountMailer: ReturnType<typeof createAccountMailer> | undefined,
+  socialSignIn: SocialSignIn,
 ) {
   return createAuthServer({
     database,
@@ -210,6 +206,7 @@ function createProductionAuthServer(
     ...(trustedClientIpHeader === undefined ? {} : { trustedClientIpHeader }),
     ...(invitationMailer === undefined ? {} : { invitationMailer }),
     ...(accountMailer === undefined ? {} : { accountMailer }),
+    socialSignIn,
     // Hosted: new organizations are stamped with the Free plan and stay on it until someone buys
     // a plan. Self-hosted keeps the unlimited default and never touches Stripe.
     ...(billing === null
@@ -312,37 +309,26 @@ async function main(): Promise<void> {
   const config = loadRuntimeConfig();
   const port = readPort();
   const canonicalRequestOrigin = nonEmptyEnvironment(process.env["PASEO_HUB_APP_URL"]);
-  const server = createFetchServer((request) => build.default.fetch(request), {
+  const server = createHubServer({
+    fetch: (request) => build.default.fetch(request),
+    upgrade: (request, socket, head) =>
+      handleDaemonUpgradeRequest({
+        request,
+        socket,
+        handle: () => build.handleDaemonUpgrade(request, socket, head),
+      }),
+    stopRuntime: () => build.stopProductionRuntime(),
     ...(config.trustedClientIpHeader === undefined
       ? {}
       : { trustedClientIpHeader: config.trustedClientIpHeader }),
     ...(canonicalRequestOrigin === undefined ? {} : { canonicalRequestOrigin }),
   });
-  server.on("upgrade", (request, socket, head) => {
-    void handleDaemonUpgradeRequest({
-      request,
-      socket,
-      handle: () => build.handleDaemonUpgrade(request, socket, head),
-    });
-  });
   const appUrl =
     nonEmptyEnvironment(process.env["PASEO_HUB_APP_URL"]) ?? `http://localhost:${port}`;
-  server.listen(port, config.bind, () => {
-    logger.info(`server started, available at: ${appUrl}`);
-  });
+  await server.listen(port, config.bind);
+  logger.info(`server started, available at: ${appUrl}`);
 
-  const stop = async () => {
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => {
-        if (error !== undefined) {
-          reject(error);
-          return;
-        }
-        resolve();
-      });
-    });
-    await build.stopProductionRuntime();
-  };
+  const stop = () => server.close();
   const stopAfterSignal = () => {
     void shutdownProductionServer(stop)
       .then((clean) => {

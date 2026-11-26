@@ -7,6 +7,8 @@ import { MemoryDiscordBotClient } from "./memory-bot.js";
 import { createDiscordTriggerProvider } from "./provider.js";
 import type { NormalizedDiscordMessageEvent } from "./events.js";
 import { isAcceptedTriggerProviderMatch } from "../index.js";
+import { DiscordAPIError, HTTPError } from "discord.js";
+import { retryAdvice } from "../../failures/index.js";
 
 describe("Discord Phase 1 trigger provider", () => {
   it("explains a monthly execution denial in the originating thread", async () => {
@@ -230,6 +232,7 @@ describe("Discord Phase 1 trigger provider", () => {
           author: { id: "401", username: "maintainer", bot: false },
           createdAt: "2026-05-18T23:59:00.000Z",
           attachments: [attachment],
+          embeds: [],
           referencedMessage: null,
         },
       ],
@@ -310,6 +313,7 @@ describe("Discord Phase 1 trigger provider", () => {
               url: attachments.urlFor(contextAttachment.id, "execution-discord-materialize"),
             },
           ],
+          embeds: [],
           referenced_message: null,
         },
         thread: {
@@ -332,6 +336,7 @@ describe("Discord Phase 1 trigger provider", () => {
                   url: attachments.urlFor(contextAttachment.id, "execution-discord-materialize"),
                 },
               ],
+              embeds: [],
               referenced_message: null,
             },
           ],
@@ -370,6 +375,7 @@ describe("Discord Phase 1 trigger provider", () => {
       author: { id: "401", username: "maintainer", bot: false },
       createdAt: "2026-05-18T23:59:00.000Z",
       attachments: [],
+      embeds: [],
       referencedMessage: null,
     };
     const bot = new MemoryDiscordBotClient({
@@ -413,11 +419,69 @@ describe("Discord Phase 1 trigger provider", () => {
           channel: { id: "200" },
           created_at: "2026-05-18T23:59:00.000Z",
           attachments: [],
+          embeds: [],
           referenced_message: null,
         },
         thread: null,
       },
     });
+  });
+
+  it("carries embeds from referenced messages and thread starters into context", async () => {
+    const { project, revision, store } = await activeConfiguration();
+    const embed = {
+      title: "Deploy failed",
+      description: "The production deploy exited with code 1",
+      url: "https://ci.example.test/runs/42",
+      author: "CI",
+      fields: [{ name: "Branch", value: "main" }],
+      footer: "Run 42",
+    };
+    const embedOnlyMessage = (id: string, channelId: string) => ({
+      id,
+      channelId,
+      content: "",
+      author: { id: "402", username: "ci-bot", bot: true },
+      createdAt: "2026-05-18T23:59:00.000Z",
+      attachments: [],
+      embeds: [embed],
+      referencedMessage: null,
+    });
+    const bot = new MemoryDiscordBotClient({
+      selfUserId: "900",
+      messages: [embedOnlyMessage("298", "200")],
+      threadMessages: [embedOnlyMessage("207", "200")],
+    });
+    const provider = createDiscordTriggerProvider({
+      configurationStoreForProject: () => store,
+      bot,
+    });
+    const match = (
+      await provider.match(
+        external(
+          project.id,
+          revision.id,
+          event({
+            channelId: "207",
+            threadId: "207",
+            parentChannelId: "200",
+            referencedMessage: { id: "298", channelId: "200", guildId: "100" },
+          }),
+        ),
+      )
+    )[0];
+    if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+
+    const materialized = await provider.materializeContext!({
+      executionId: "execution-discord-embeds",
+      organizationId: "org_1",
+      projectId: project.id,
+      providerEventReceiptId: "11111111-1111-4111-8111-111111111118",
+      triggerContext: match.triggerContext,
+    });
+
+    assert.deepEqual(materialized?.discord.referenced_message?.embeds, [embed]);
+    assert.deepEqual(materialized?.discord.thread?.messages[0]?.embeds, [embed]);
   });
 
   it("does not require attachment capability during Discord ingestion", async () => {
@@ -523,6 +587,50 @@ describe("Discord Phase 1 trigger provider", () => {
     );
   });
 
+  it.each([
+    {
+      name: "Missing Permissions",
+      error: discordApiError(403, 50013),
+      retryable: false,
+    },
+    { name: "Unknown Channel", error: discordApiError(404, 10003), retryable: false },
+    { name: "Missing Access", error: discordApiError(403, 50001), retryable: false },
+    {
+      name: "an outage",
+      error: new HTTPError(503, "Service Unavailable", "PUT", "https://discord.com/api", {}),
+      retryable: true,
+    },
+  ])(
+    "tells terminal-notification retry whether Discord's $name can succeed later",
+    async ({ error, retryable }) => {
+      const { project, revision, store } = await activeConfiguration();
+      const provider = createDiscordTriggerProvider({
+        configurationStoreForProject: () => store,
+        bot: new FailingDiscordBotClient({
+          selfUserId: "900",
+          failReactionEmoji: "✅",
+          reactionError: error,
+        }),
+      });
+      const match = (await provider.match(external(project.id, revision.id, event())))[0];
+      if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected accepted match");
+
+      const thrown = await provider.onAgentExecutionCompleted!(
+        match.triggerContext,
+        match.outputContext,
+        {
+          status: "succeeded",
+        },
+      ).then(
+        () => undefined,
+        (rejection: unknown) => rejection,
+      );
+
+      assert.equal(thrown, error);
+      assert.equal(retryAdvice(thrown).retryable, retryable);
+    },
+  );
+
   it("propagates terminal Discord reaction and notice failures", async () => {
     const { project, revision, store } = await activeConfiguration();
     const reactionBot = new FailingDiscordBotClient({
@@ -576,19 +684,22 @@ class FailingDiscordBotClient extends MemoryDiscordBotClient {
   constructor(
     options: ConstructorParameters<typeof MemoryDiscordBotClient>[0] & {
       failReactionEmoji?: string;
+      reactionError?: Error;
       failMessages?: boolean;
     },
   ) {
     super(options);
     this.failReactionEmoji = options.failReactionEmoji;
+    this.reactionError = options.reactionError ?? new Error("discord reaction failed");
     this.failMessages = options.failMessages ?? false;
   }
 
   private readonly failReactionEmoji: string | undefined;
+  private readonly reactionError: Error;
   private readonly failMessages: boolean;
 
   override async createReaction(input: Parameters<MemoryDiscordBotClient["createReaction"]>[0]) {
-    if (input.emoji === this.failReactionEmoji) throw new Error("discord reaction failed");
+    if (input.emoji === this.failReactionEmoji) throw this.reactionError;
     await super.createReaction(input);
   }
 
@@ -742,4 +853,15 @@ function event(
     attachments: overrides.attachments ?? [],
     referencedMessage: overrides.referencedMessage ?? null,
   };
+}
+
+function discordApiError(status: number, code: number): DiscordAPIError {
+  return new DiscordAPIError(
+    { code, message: "refused" },
+    code,
+    status,
+    "PUT",
+    "https://discord.com/api/v10/channels/200/messages/201/reactions",
+    {},
+  );
 }

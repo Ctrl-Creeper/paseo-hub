@@ -1,5 +1,8 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { parseDocument } from "yaml";
-import { expect, type Page } from "@playwright/test";
+import { expect, type Page, type Request } from "@playwright/test";
+import { allowClipboard } from "./apps.js";
 import type { BuiltApplication } from "./hub.js";
 
 export class OrganizationTriggers {
@@ -11,6 +14,26 @@ export class OrganizationTriggers {
     await expect(this.page.getByRole("heading", { name: "Triggers", level: 1 })).toBeVisible();
   }
 
+  private row(name: string) {
+    return this.page
+      .getByRole("table", { name: "Triggers" })
+      .getByRole("row")
+      .filter({ has: this.page.getByRole("link", { name, exact: true }) });
+  }
+
+  async expectLastTriggered(name: string, status: string) {
+    await expect(this.row(name)).toContainText(status);
+  }
+
+  /** The "Last triggered" time opens Activity on that trigger's runs. */
+  async openLastTriggered(name: string) {
+    await this.row(name).getByTitle("View activity").click();
+  }
+
+  async openTriggerActivity() {
+    await this.page.getByRole("link", { name: "View activity" }).click();
+  }
+
   async expectEmpty() {
     await expect(this.page.getByText("No triggers", { exact: true })).toBeVisible();
   }
@@ -19,36 +42,214 @@ export class OrganizationTriggers {
     await this.page.getByRole("link", { name: "New trigger" }).click();
     await expect(this.page).toHaveURL(/\/triggers\/new$/u);
     await expect(this.page.getByRole("heading", { name: "New trigger", level: 1 })).toBeVisible();
-    await expect(this.page.getByRole("heading", { name: "The event" })).toBeVisible();
-    await expect(this.page.getByRole("heading", { name: "Where it runs" })).toBeVisible();
-    // The last step keeps its place and says what it is waiting for, so the shape of the
-    // trigger is on screen before a daemon is chosen; only its controls are absent.
-    await expect(this.page.getByRole("heading", { name: "What runs there" })).toBeVisible();
+    // Every step keeps its place and says what it is waiting for, so the shape of the trigger
+    // is on screen before a daemon is chosen; only the controls of the later steps are absent.
+    for (const step of ["When it runs", "Where it runs", "What runs there", "What it can access"])
+      await expect(this.page.getByRole("heading", { name: step, exact: true })).toBeVisible();
     const topbar = this.page.locator("header.sticky");
     await expect(topbar.getByRole("radio", { name: "Form" })).toBeEnabled();
     await expect(topbar.getByRole("radio", { name: "YAML" })).toBeVisible();
     await expect(topbar.getByRole("button", { name: "Discard" })).toBeVisible();
-    await expect(this.page.getByLabel("Trigger ID")).toHaveValue("Assigned when saved");
+    await expect(this.page.getByLabel("Trigger ID")).toHaveCount(0);
   }
 
-  /** No daemon yet: the target and agent steps keep their place and say what they wait for. */
-  async expectWaitingForDaemon() {
+  /** No daemon yet: the steps after it keep their place and offer nothing to press. */
+  async expectWaitingForDaemon(reason: "Choose a daemon first" | "Connect a daemon first") {
+    await expect(this.page.getByText(reason, { exact: true })).toHaveCount(2);
     await expect(this.page.getByRole("combobox", { name: "Agent" })).toBeHidden();
     await expect(this.page.getByLabel("Working directory")).toBeHidden();
+    await expect(this.page.getByLabel("Instructions", { exact: true })).toBeHidden();
+    await expect(this.page.getByRole("button", { name: "Add integration" })).toBeHidden();
   }
 
   /**
-   * The organization's daemon is already chosen, and the working directory is the one thing the
-   * form does not guess: a prefilled path that did not exist on the daemon was saved as it was and
-   * failed the first run, so the field starts empty and the agent step waits for it.
+   * A daemon but no working directory yet: the agent and its access are read from that directory,
+   * so those steps wait for it rather than offering controls a submit would then refuse.
+   */
+  async expectWaitingForWorkingDirectory() {
+    await expect(
+      this.page.getByText("Choose a working directory first", { exact: true }),
+    ).toHaveCount(2);
+    await expect(
+      this.page.getByRole("combobox", { name: "Working directory", exact: true }),
+    ).toContainText("Select a project or type a path");
+    await expect(this.page.getByRole("combobox", { name: "Agent" })).toBeHidden();
+    await expect(this.page.getByLabel("Instructions", { exact: true })).toBeHidden();
+    await expect(this.page.getByRole("button", { name: "Add integration" })).toBeHidden();
+  }
+
+  /**
+   * The event picker opens on the events Hub sends itself, which need no integration, and says
+   * there is more below: a row cut by the bottom edge under a fade that lifts at the end.
+   */
+  async expectEventPickerScrolls(path: string) {
+    await this.page.getByRole("combobox", { name: "Event", exact: true }).click();
+    const list = this.page.getByRole("listbox");
+    const options = list.getByRole("option");
+    await expect(options.nth(0)).toHaveAttribute("data-value", "webhook.received");
+    await expect(options.nth(1)).toHaveAttribute("data-value", "schedule.tick");
+    await expect(options.nth(2)).toHaveAttribute("data-value", "manual.run");
+    const above = this.page.locator('[data-slot="command-list-fade"][data-edge="top"]');
+    const below = this.page.locator('[data-slot="command-list-fade"][data-edge="bottom"]');
+    await expect(below).toBeVisible();
+    await expect(above).toBeHidden();
+    // Some option starts inside the list and ends past its bottom edge.
+    const cut = await list.evaluate((element) => {
+      const bottom = element.getBoundingClientRect().bottom;
+      return Array.from(element.querySelectorAll('[role="option"]')).some((option) => {
+        const box = option.getBoundingClientRect();
+        return box.top < bottom - 8 && box.bottom > bottom + 8;
+      });
+    });
+    expect(cut).toBe(true);
+    await this.page.screenshot({ path });
+    await list.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
+    await expect(below).toBeHidden();
+    await expect(above).toBeVisible();
+    await this.page.keyboard.press("Escape");
+  }
+
+  /** A provider that failed on the daemon is not news while another one offers models. */
+  async expectNoProviderFailure() {
+    await expect(this.page.getByRole("combobox", { name: "Agent", exact: true })).toBeVisible();
+    await expect(
+      this.page.getByRole("alert").filter({ hasText: "Providers unavailable" }),
+    ).toHaveCount(0);
+  }
+
+  async chooseDaemon(daemon: string) {
+    await this.selectOption("Daemon", daemon);
+  }
+
+  /** The directory picker suggests the daemon's projects, each by name over its path. */
+  async expectProjectChoices(projects: readonly { name: string; path: string }[]) {
+    await this.page.getByRole("combobox", { name: "Working directory", exact: true }).click();
+    await expect(this.page.getByRole("option")).toHaveCount(projects.length);
+    for (const project of projects) {
+      await expect(
+        this.page.getByRole("option", { name: `${project.name} ${project.path}`, exact: true }),
+      ).toBeVisible();
+    }
+  }
+
+  /** Narrows the open directory picker to one project and takes it. */
+  async chooseListedProject(search: string, path: string) {
+    await this.page.getByPlaceholder("Search projects or type a path…").fill(search);
+    await expect(this.page.getByRole("option")).toHaveCount(1);
+    await this.page.locator(`[role="option"][data-value=${JSON.stringify(path)}]`).click();
+    await this.expectWorkingDirectory(path);
+  }
+
+  async expectWorkingDirectory(path: string) {
+    await expect(
+      this.page.getByRole("combobox", { name: "Working directory", exact: true }),
+    ).toHaveAttribute("data-value", path);
+  }
+
+  /** Any absolute path is a working directory, whether or not the daemon suggested it. */
+  async chooseWorkingDirectory(path: string) {
+    await this.page.getByRole("combobox", { name: "Working directory", exact: true }).click();
+    await this.page.getByPlaceholder("Search projects or type a path…").fill(path);
+    await this.page.locator(`[role="option"][data-value=${JSON.stringify(path)}]`).click();
+    await this.expectWorkingDirectory(path);
+  }
+
+  /** Even while project suggestions are still loading, typing an absolute path and pressing Enter selects it. */
+  async chooseWorkingDirectoryWhileLoading(path: string) {
+    await this.page.getByRole("combobox", { name: "Working directory", exact: true }).click();
+    await expect(this.page.getByText("Loading…", { exact: true })).toBeVisible();
+    const search = this.page.getByPlaceholder("Search projects or type a path…");
+    await search.fill(path);
+    await expect(
+      this.page.locator(`[role="option"][data-value=${JSON.stringify(path)}]`),
+    ).toBeVisible();
+    await search.press("Enter");
+    await this.expectWorkingDirectory(path);
+  }
+
+  /**
+   * Typing an absolute path that prefixes a suggested project keeps the exact typed path as the
+   * default Enter choice while leaving the matching project on offer for deliberate selection.
+   */
+  async chooseTypedPathOverMatchingProject(typedPath: string, matchingProjectPath: string) {
+    await this.page.getByRole("combobox", { name: "Working directory", exact: true }).click();
+    const search = this.page.getByPlaceholder("Search projects or type a path…");
+    await search.fill(typedPath);
+    await expect(
+      this.page.locator(`[role="option"][data-value=${JSON.stringify(typedPath)}]`),
+    ).toBeVisible();
+    await expect(
+      this.page.locator(`[role="option"][data-value=${JSON.stringify(matchingProjectPath)}]`),
+    ).toBeVisible();
+    await search.press("Enter");
+    await this.expectWorkingDirectory(typedPath);
+  }
+
+  /** The audience sits closed under the event, and its header reads the current answer. */
+  async expectAudience(audience: string) {
+    await expect(this.audienceDisclosure()).toContainText(`Audience: ${audience}`);
+    await expect(this.audienceDisclosure()).toHaveAttribute("aria-expanded", "false");
+  }
+
+  async openAudience() {
+    await this.audienceDisclosure().click();
+    await expect(this.page.getByRole("radiogroup", { name: "Audience" })).toBeVisible();
+  }
+
+  async expectAudienceChoices(audiences: readonly string[], chosen: string) {
+    const group = this.page.getByRole("radiogroup", { name: "Audience" });
+    await expect(group.getByRole("radio")).toHaveText([...audiences]);
+    await expect(group.getByRole("radio", { name: chosen, exact: true })).toBeChecked();
+  }
+
+  async chooseAudience(audience: string) {
+    await this.page
+      .getByRole("radiogroup", { name: "Audience" })
+      .getByRole("radio", { name: audience, exact: true })
+      .click();
+  }
+
+  async chooseEvent(event: string) {
+    await this.selectOption("Event", event);
+  }
+
+  async chooseConnection(connection: string) {
+    await this.selectOption("Connection", connection);
+  }
+
+  async openContinuity() {
+    await this.page.getByRole("button", { name: /Advanced.*Agent continuity/u }).click();
+    await expect(this.page.getByRole("radiogroup", { name: "Agent continuity" })).toBeVisible();
+  }
+
+  /** Whether the trigger's agents start hidden in Paseo, and whether Paseo archives them after. */
+  async setPaseoVisibility(visibility: { background: boolean; autoArchive: boolean }) {
+    await this.openContinuity();
+    await this.page
+      .getByRole("checkbox", { name: "Run in background" })
+      .setChecked(visibility.background);
+    await this.page
+      .getByRole("checkbox", { name: "Auto-archive after completion" })
+      .setChecked(visibility.autoArchive);
+  }
+
+  private audienceDisclosure() {
+    return this.page.getByRole("button", { name: /Advanced.*Audience/u });
+  }
+
+  /**
+   * The organization's only daemon is already chosen, and the working directory is the one thing
+   * the form does not guess: a prefilled path that did not exist on the daemon was saved as it was
+   * and failed the first run, so the field starts empty.
    */
   async expectDaemonPreselected(daemon: string) {
-    await expect(this.page.getByRole("combobox", { name: "Run on daemon" })).toHaveAttribute(
+    await expect(this.page.getByRole("combobox", { name: "Daemon", exact: true })).toHaveAttribute(
       "data-value",
       daemon,
     );
-    await expect(this.page.getByLabel("Working directory")).toHaveValue("");
-    await expect(this.page.getByLabel("Working directory")).toHaveAttribute("required", "");
+    const directory = this.page.getByRole("combobox", { name: "Working directory", exact: true });
+    await expect(directory).toHaveAttribute("data-value", "");
+    await expect(directory).toHaveAttribute("aria-required", "true");
   }
 
   /** Pressing save with the document as it is answers in the summary and stays on the editor. */
@@ -67,7 +268,7 @@ export class OrganizationTriggers {
   }
 
   async exploreEventQualifiers() {
-    await this.page.getByRole("combobox", { name: "When this happens" }).click();
+    await this.page.getByRole("combobox", { name: "Event", exact: true }).click();
     const search = this.page.getByPlaceholder("Select an event…");
     await expect(search).toBeFocused();
     await expect(search).toHaveCSS("outline-style", "none");
@@ -80,14 +281,14 @@ export class OrganizationTriggers {
       }),
     ).toBeVisible();
     await this.page.keyboard.press("Escape");
-    await this.selectOption("When this happens", "github.pull_request_label_added");
+    await this.selectOption("Event", "github.pull_request_label_added");
     await expect(this.page.getByRole("radio", { name: "Any label", exact: true })).toBeHidden();
     await expect(this.page.getByLabel("Added label", { exact: true })).toHaveValue("");
 
     await this.page.getByLabel("Added label", { exact: true }).fill("ready-for-review");
     await this.page.getByLabel("Added label", { exact: true }).scrollIntoViewIfNeeded();
     await this.page.screenshot({ path: "e2e/screenshots/triggers/added-label-qualifier.png" });
-    await this.selectOption("When this happens", "github.issue_label_added");
+    await this.selectOption("Event", "github.issue_label_added");
     await expect(this.page.getByLabel("Added label", { exact: true })).toHaveValue(
       "ready-for-review",
     );
@@ -96,9 +297,9 @@ export class OrganizationTriggers {
       "required",
       "",
     );
-    await this.selectOption("When this happens", "slack.mention");
+    await this.selectOption("Event", "slack.mention");
     await expect(this.page.getByLabel("Added label", { exact: true })).toBeHidden();
-    await this.selectOption("When this happens", "github.pull_request_label_added");
+    await this.selectOption("Event", "github.pull_request_label_added");
     await expect(this.page.getByLabel("Added label", { exact: true })).toHaveValue("");
     await expect(this.page.getByRole("radio", { name: "Any label", exact: true })).toBeHidden();
   }
@@ -116,32 +317,24 @@ export class OrganizationTriggers {
     prompt: string;
   }) {
     await this.page.getByLabel("Trigger name").fill(input.name);
-    await this.selectOption("When this happens", "slack.mention");
-    // An event that arrives on a connection is an event someone sends, so the step asking who
-    // may send it joins the run; a manual run has no audience and no step.
-    await expect(this.page.getByRole("heading", { name: "Who can invoke it" })).toBeVisible();
+    await this.selectOption("Event", "slack.mention");
     await this.selectOption("Connection", input.connection);
-    await this.page.getByRole("radio", { name: "Specific people" }).click();
+    // An event someone sends has an audience. A Slack mention starts open to the workspace, and
+    // naming people is the choice behind the closed header.
+    await this.expectAudience("Everyone");
+    await this.openAudience();
+    await this.expectAudienceChoices(["Everyone", "Specific people"], "Everyone");
+    await this.chooseAudience("Specific people");
     await this.page.getByLabel("User IDs").fill(input.users);
-    await this.selectOption("Run on daemon", input.daemon);
+    await this.selectOption("Daemon", input.daemon);
+    await this.expectWaitingForWorkingDirectory();
+    await this.chooseWorkingDirectory(input.cwd);
     await expect(this.page.getByRole("combobox", { name: "Agent" })).toHaveAttribute(
       "data-value",
       "",
     );
-    await expect(this.page.getByRole("combobox", { name: "Execution mode" })).toHaveAttribute(
-      "data-value",
-      "",
-    );
-    await this.page.getByLabel("Working directory").fill(input.cwd);
+    await expect(this.page.getByRole("combobox", { name: "Execution mode" })).toBeHidden();
     await this.selectAgent(input.agent);
-    await expect(this.page.getByRole("combobox", { name: "Execution mode" })).toHaveAttribute(
-      "data-value",
-      "",
-    );
-    await expect(this.page.getByRole("combobox", { name: "Thinking" })).toHaveAttribute(
-      "data-value",
-      "",
-    );
     await this.selectOption("Execution mode", input.mode);
     await this.selectOption("Thinking", input.thinking);
     await this.page.getByRole("button", { name: "Advanced provider options" }).click();
@@ -149,23 +342,267 @@ export class OrganizationTriggers {
     await this.page.getByLabel("Instructions", { exact: true }).fill(input.prompt);
   }
 
+  async expectReportedModelChoices(cwd: string, labels: string[]) {
+    await this.chooseWorkingDirectory(cwd);
+    const picker = this.page.getByRole("combobox", { name: "Agent", exact: true });
+    await picker.scrollIntoViewIfNeeded();
+    await picker.click();
+    await expect(this.page.getByRole("option")).toHaveCount(labels.length);
+    for (const label of labels)
+      await expect(this.page.getByRole("option").filter({ hasText: label })).toBeVisible();
+    await this.page.keyboard.press("Escape");
+  }
+
+  async expectNoExecutionModes() {
+    await expect(this.page.getByRole("combobox", { name: "Execution mode" })).toHaveCount(0);
+  }
+
+  async expectMaterializedSelections(mode: string, thinking: string) {
+    await expect(this.page.getByRole("combobox", { name: "Execution mode" })).toHaveAttribute(
+      "data-value",
+      mode,
+    );
+    await expect(this.page.getByRole("combobox", { name: "Thinking" })).toHaveAttribute(
+      "data-value",
+      thinking,
+    );
+  }
+
   async configureManual(input: {
     name: string;
     daemon: string;
     cwd: string;
     agent: string;
-    mode: string;
-    thinking: string;
+    mode?: string;
+    thinking?: string;
+    providerOptions?: string;
     prompt: string;
   }) {
     await this.page.getByLabel("Trigger name").fill(input.name);
-    await this.selectOption("When this happens", "manual.run");
-    await this.selectOption("Run on daemon", input.daemon);
-    await this.page.getByLabel("Working directory").fill(input.cwd);
+    await this.selectOption("Event", "manual.run");
+    await this.selectOption("Daemon", input.daemon);
+    await this.chooseWorkingDirectory(input.cwd);
     await this.selectAgent(input.agent);
-    await this.selectOption("Execution mode", input.mode);
-    await this.selectOption("Thinking", input.thinking);
+    if (input.mode !== undefined) await this.selectOption("Execution mode", input.mode);
+    if (input.thinking !== undefined) await this.selectOption("Thinking", input.thinking);
+    if (input.providerOptions !== undefined) {
+      await this.page.getByRole("button", { name: "Advanced provider options" }).click();
+      await this.page.getByLabel("Provider options (JSON)").fill(input.providerOptions);
+    }
     await this.page.getByLabel("Instructions", { exact: true }).fill(input.prompt);
+  }
+
+  async configureWebhook(daemon: string) {
+    await this.configureManual({
+      name: "webhook-alert",
+      daemon,
+      cwd: "/workspace/acme",
+      agent: "opencode/gateway/vendor/model-v1",
+      mode: "full-access",
+      thinking: "low",
+      prompt: "Summarize the alert.",
+    });
+    await this.selectOption("Event", "webhook.received");
+  }
+
+  async addScheduleBeforeWebhook() {
+    await this.switchToYaml();
+    const document = parseDocument(await this.readYaml(), { compat: ["timestamp"] });
+    document.set("on", {
+      "schedule.tick": {
+        recurrence: { start: "2099-01-01T09:00:00", rule: "FREQ=DAILY", timezone: "UTC" },
+      },
+      "webhook.received": {},
+    });
+    await this.replaceYaml(document.toString({ lineWidth: 0 }));
+  }
+
+  /**
+   * Creating a webhook trigger lands on its endpoint, above the form, with the secret it was born
+   * with on screen. The response that carries that secret is never cached.
+   */
+  async createWebhookTrigger(name: string) {
+    return this.saveWebhookTrigger(name, "Create trigger");
+  }
+
+  /** A saved trigger that starts listening for webhooks gets its endpoint and secret the same way. */
+  async changeToWebhook(name: string) {
+    await this.selectOption("Event", "webhook.received");
+    return this.saveWebhookTrigger(name, "Save changes");
+  }
+
+  private async saveWebhookTrigger(name: string, action: "Create trigger" | "Save changes") {
+    const saved = this.page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        (response.request().postData() ?? "").includes("webhook.received"),
+    );
+    await this.page.locator("#trigger-editor-form").getByRole("button", { name: action }).click();
+    expect((await saved).headers()["cache-control"]).toBe("no-store");
+    await expect(this.page).toHaveURL(/\/triggers\/[0-9a-f-]{36}$/u);
+    await expect(this.page.getByRole("heading", { name, level: 1 })).toBeVisible();
+    const endpoint = await this.expectWebhookEndpoint();
+    const card = await this.page.getByRole("heading", { name: "Webhook endpoint" }).boundingBox();
+    const form = await this.page
+      .getByRole("heading", { name: "When it runs", exact: true })
+      .boundingBox();
+    // The endpoint is what a new webhook trigger is for, so it comes before the form.
+    expect(card!.y).toBeLessThan(form!.y);
+    await expect(this.page.getByText("Secret active", { exact: true })).toBeVisible();
+    await expect(this.page.getByText("Save this secret now", { exact: true })).toBeVisible();
+    const secret = this.page.getByRole("textbox", { name: "Webhook secret" });
+    await expect(secret).toHaveValue(/^whsec_[\w-]{43}$/u);
+    return { endpoint, secret: await secret.inputValue() };
+  }
+
+  async expectWebhookEndpoint() {
+    await expect(this.page.getByRole("heading", { name: "Webhook endpoint" })).toBeVisible();
+    const url = this.page.getByText(/https?:\/\/[^ ]+\/webhooks\/wh_[\w-]{32}$/u);
+    await expect(url).toBeVisible();
+    await expect(this.page.getByRole("button", { name: "Copy curl example" })).toBeVisible();
+    return url.innerText();
+  }
+
+  async copyWebhookUrl(endpoint: string) {
+    await allowClipboard(this.page, new URL(this.page.url()).origin);
+    await this.page.getByRole("button", { name: "Copy Webhook URL" }).click();
+    await expect
+      .poll(() => this.page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(endpoint);
+  }
+
+  async copyCurlExample(endpoint: string) {
+    await allowClipboard(this.page, new URL(this.page.url()).origin);
+    await this.page.evaluate(() => navigator.clipboard.writeText(""));
+    await this.page.getByRole("button", { name: "Copy curl example" }).click();
+    await expect
+      .poll(() => this.page.evaluate(() => navigator.clipboard.readText()))
+      .toContain(`curl -X POST '${endpoint}'`);
+    return this.page.evaluate(() => navigator.clipboard.readText());
+  }
+
+  /** Paste a copied command into a shell, and answer with the HTTP status it printed. */
+  async runInShell(command: string) {
+    const { stdout } = await promisify(execFile)("sh", [
+      "-c",
+      `${command} -sS -o /dev/null -w '%{http_code}'`,
+    ]);
+    return stdout;
+  }
+
+  async rotateWebhookSecret() {
+    await this.page.getByRole("button", { name: "Rotate secret", exact: true }).click();
+    const dialog = this.page.getByRole("alertdialog", { name: "Rotate webhook secret?" });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "Rotate secret", exact: true }).click();
+    const secret = this.page.getByRole("textbox", { name: "Webhook secret" });
+    await expect(secret).toHaveValue(/^whsec_[\w-]{43}$/u);
+    return secret.inputValue();
+  }
+
+  /**
+   * The browser cannot tell a rotation that never reached Hub from one whose answer was lost after
+   * it replaced the secret, so a failed rotation stops vouching for the secret on screen.
+   */
+  async rotateWebhookSecretUnsuccessfully() {
+    await this.page.route("**/*", (route) =>
+      isRotation(route.request()) ? route.abort() : route.fallback(),
+    );
+    await this.page.getByRole("button", { name: "Rotate secret", exact: true }).click();
+    const dialog = this.page.getByRole("alertdialog", { name: "Rotate webhook secret?" });
+    await dialog.getByRole("button", { name: "Rotate secret", exact: true }).click();
+    await expect(this.page.getByText("Webhook secret unavailable", { exact: true })).toBeVisible();
+    await expect(this.page.getByRole("textbox", { name: "Webhook secret" })).toBeHidden();
+    await this.page.unrouteAll();
+  }
+
+  /**
+   * Starts a rotation that Hub carries out but whose answer reaches the page only when the returned
+   * `answer` is called, the way a slow network delivers it.
+   */
+  async rotateWebhookSecretAnsweredLate() {
+    let release = (): void => {};
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let carriedOut = (): void => {};
+    const rotated = new Promise<void>((resolve) => {
+      carriedOut = resolve;
+    });
+    let held = false;
+    await this.page.route("**/*", async (route) => {
+      if (held || !isRotation(route.request())) return route.fallback();
+      held = true;
+      const response = await route.fetch();
+      carriedOut();
+      await released;
+      await route.fulfill({ response });
+    });
+    await this.page.getByRole("button", { name: "Rotate secret", exact: true }).click();
+    const dialog = this.page.getByRole("alertdialog", { name: "Rotate webhook secret?" });
+    await dialog.getByRole("button", { name: "Rotate secret", exact: true }).click();
+    await rotated;
+    return {
+      /** Delivers the held answer and waits for the trigger list it refreshes. */
+      answer: async () => {
+        const refreshed = this.page.waitForRequest(isRefresh);
+        release();
+        await refreshed;
+        await this.page.unrouteAll();
+      },
+    };
+  }
+
+  /**
+   * Holds every trigger list refresh until the returned `release` is called, the way a slow
+   * network delivers it.
+   */
+  async holdTriggerRefresh() {
+    let release = (): void => {};
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await this.page.route("**/*", async (route) => {
+      if (!isRefresh(route.request())) return route.fallback();
+      await released;
+      await route.fallback();
+    });
+    return {
+      release: async () => {
+        release();
+        await this.page.unrouteAll();
+      },
+    };
+  }
+
+  /** After a reload only the hash is left, so the request asks for the secret the reader saved. */
+  async reloadWebhookSettings() {
+    await this.page.reload();
+    await this.expectSecretHidden();
+  }
+
+  /** Back to the page before the trigger and forward again: a shown secret is not shown twice. */
+  async returnThroughHistory() {
+    const trigger = this.page.url();
+    await this.page.goBack();
+    await expect(this.page).not.toHaveURL(trigger);
+    await this.page.goForward();
+    await expect(this.page).toHaveURL(trigger);
+    await this.expectSecretHidden();
+  }
+
+  private async expectSecretHidden() {
+    await expect(this.page.getByText("Secret active", { exact: true })).toBeVisible();
+    await expect(
+      this.page.getByRole("button", { name: "Rotate secret", exact: true }),
+    ).toBeVisible();
+    await expect(this.page.getByRole("textbox", { name: "Webhook secret" })).toBeHidden();
+    await expect(
+      this.page.getByText(
+        "Replace $WEBHOOK_SECRET with your saved secret, or rotate to generate a new one",
+        { exact: true },
+      ),
+    ).toBeVisible();
   }
 
   async configureSchedule(daemon: string) {
@@ -178,10 +615,12 @@ export class OrganizationTriggers {
       thinking: "low",
       prompt: "Read reports and summarize new items.",
     });
-    await this.selectOption("When this happens", "schedule.tick");
+    await this.selectOption("Event", "schedule.tick");
+    await this.openContinuity();
     await this.page.getByRole("radio", { name: "New agent", exact: true }).check();
     await expect(this.page.getByRole("combobox", { name: "Connection", exact: true })).toBeHidden();
-    await expect(this.page.getByRole("heading", { name: "Who can invoke it" })).toBeHidden();
+    // A schedule has no outside sender, so there is no audience to choose.
+    await expect(this.audienceDisclosure()).toHaveCount(0);
     await this.expectSimpleScheduleControls();
     await this.page.getByLabel("Time 1", { exact: true }).fill("08:15");
     await this.page.getByRole("button", { name: "Add time", exact: true }).click();
@@ -193,6 +632,83 @@ export class OrganizationTriggers {
         .getByRole("status")
         .filter({ hasText: "Every day at 08:15 and 16:45 (Europe/Berlin)" }),
     ).toBeVisible();
+  }
+
+  async grantScheduledIntegrationTools() {
+    await expect(
+      this.page.getByRole("heading", { name: "What it can access", exact: true }),
+    ).toBeVisible();
+    await expect(this.page.getByText("No integrations granted", { exact: true })).toBeVisible();
+
+    await this.addIntegrationAccess("GitHub");
+    const github = this.page.getByRole("region", { name: "GitHub", exact: true });
+    await expect(github.getByRole("combobox", { name: "Connection", exact: true })).toBeFocused();
+    await expect(github.getByRole("combobox", { name: "Connection", exact: true })).toHaveAttribute(
+      "data-value",
+      "acme-inc-github",
+    );
+    await github.getByRole("textbox", { name: "Repositories", exact: true }).fill("acme-inc/hub");
+    await github
+      .getByRole("textbox", { name: "Permissions (JSON)", exact: true })
+      .fill('{"contents":"write","pull_requests":"write"}');
+
+    await this.addIntegrationAccess("Slack");
+    const slack = this.page.getByRole("region", { name: "Slack", exact: true });
+    await expect(slack.getByRole("combobox", { name: "Connection", exact: true })).toBeFocused();
+    await expect(slack.getByRole("combobox", { name: "Connection", exact: true })).toHaveAttribute(
+      "data-value",
+      "company-slack",
+    );
+    await slack.getByRole("textbox", { name: "Channel IDs", exact: true }).fill("CALLOWED");
+    await slack.getByRole("checkbox", { name: "Post messages", exact: true }).check();
+
+    await this.addIntegrationAccess("Discord");
+    const discord = this.page.getByRole("region", { name: "Discord", exact: true });
+    await expect(discord.getByRole("combobox", { name: "Connection", exact: true })).toBeFocused();
+    await expect(
+      discord.getByRole("combobox", { name: "Connection", exact: true }),
+    ).toHaveAttribute("data-value", "company-discord");
+    await discord
+      .getByRole("textbox", { name: "Channel IDs", exact: true })
+      .fill("123456789012345678");
+    await discord.getByRole("checkbox", { name: "Read messages", exact: true }).check();
+
+    await expect(
+      this.page.getByRole("button", { name: "Add integration", exact: true }),
+    ).toHaveCount(0);
+  }
+
+  async addIntegrationAccess(provider: "GitHub" | "Slack" | "Discord") {
+    await this.page.getByRole("button", { name: "Add integration", exact: true }).click();
+    await this.page.getByRole("menuitem", { name: provider, exact: true }).click();
+  }
+
+  async expectScheduledIntegrationTools() {
+    const github = this.page.getByRole("region", { name: "GitHub", exact: true });
+    await expect(github.getByRole("combobox", { name: "Connection", exact: true })).toHaveAttribute(
+      "data-value",
+      "acme-inc-github",
+    );
+    await expect(github.getByRole("textbox", { name: "Repositories", exact: true })).toHaveValue(
+      "acme-inc/hub",
+    );
+    await expect(
+      github.getByRole("textbox", { name: "Permissions (JSON)", exact: true }),
+    ).toHaveValue('{\n  "contents": "write",\n  "pull_requests": "write"\n}');
+
+    const slack = this.page.getByRole("region", { name: "Slack", exact: true });
+    await expect(slack.getByRole("textbox", { name: "Channel IDs", exact: true })).toHaveValue(
+      "CALLOWED",
+    );
+    await expect(slack.getByRole("checkbox", { name: "Post messages", exact: true })).toBeChecked();
+
+    const discord = this.page.getByRole("region", { name: "Discord", exact: true });
+    await expect(discord.getByRole("textbox", { name: "Channel IDs", exact: true })).toHaveValue(
+      "123456789012345678",
+    );
+    await expect(
+      discord.getByRole("checkbox", { name: "Read messages", exact: true }),
+    ).toBeChecked();
   }
 
   async editScheduleToWeekdays() {
@@ -255,7 +771,7 @@ export class OrganizationTriggers {
 
   async useAdvancedScheduleRule(rule: string) {
     await this.switchToYaml();
-    const document = parseDocument(await this.yamlEditor().innerText(), { compat: ["timestamp"] });
+    const document = parseDocument(await this.readYaml(), { compat: ["timestamp"] });
     document.setIn(["on", "schedule.tick", "recurrence", "rule"], rule);
     await this.replaceYaml(document.toString({ lineWidth: 0 }));
     await this.switchToForm();
@@ -330,9 +846,9 @@ export class OrganizationTriggers {
       .toEqual([{ status: "running", failure_reason: null }]);
     await this.page.setViewportSize({ width: 1280, height: 900 });
     await this.page.getByRole("link", { name: "Activity", exact: true }).click();
+    await expect(this.page).toHaveURL(/\/activity$/u);
     await this.page.reload();
     const row = this.page.getByRole("row").filter({ hasText: name });
-    await expect(row.getByRole("cell", { name: "schedule", exact: true })).toBeVisible();
     await expect(row.getByRole("cell", { name: "schedule.tick", exact: true })).toBeVisible();
     await this.page.screenshot({ path: "e2e/screenshots/schedules/activity.png" });
   }
@@ -347,7 +863,7 @@ export class OrganizationTriggers {
       thinking: "high",
       prompt: "Handle the labeled item.",
     });
-    await this.selectOption("When this happens", input.event);
+    await this.selectOption("Event", input.event);
     await this.page.getByRole("combobox", { name: "Connection", exact: true }).click();
     await this.page.getByRole("option", { name: "acme-inc", exact: true }).click();
   }
@@ -364,7 +880,7 @@ export class OrganizationTriggers {
       .click();
     await expect(
       this.page.getByRole("alert").filter({ hasText: "This trigger is not ready to save" }),
-    ).toContainText("Added label is required.");
+    ).toContainText("Added label is required");
     await expect(this.page.getByLabel("Added label", { exact: true })).toHaveAttribute(
       "aria-invalid",
       "true",
@@ -374,13 +890,13 @@ export class OrganizationTriggers {
 
   async expectPersistedLabel(event: string, label: string) {
     await this.page.reload();
-    await expect(this.page.getByRole("combobox", { name: "When this happens" })).toHaveAttribute(
+    await expect(this.page.getByRole("combobox", { name: "Event", exact: true })).toHaveAttribute(
       "data-value",
       event,
     );
     await expect(this.page.getByLabel("Added label", { exact: true })).toHaveValue(label);
     await this.switchToYaml();
-    expect(parseDocument(await this.yamlEditor().innerText()).toJS()).toMatchObject({
+    expect(parseDocument(await this.readYaml()).toJS()).toMatchObject({
       on: { [event]: { filters: { label } } },
     });
     await this.switchToForm();
@@ -402,6 +918,7 @@ export class OrganizationTriggers {
   }
 
   async exerciseContinuity() {
+    await this.openContinuity();
     await expect(
       this.page.getByRole("radio", { name: "Same conversation", exact: true }),
     ).toBeChecked();
@@ -412,6 +929,9 @@ export class OrganizationTriggers {
     await this.page.getByRole("radio", { name: "New agent", exact: true }).click();
     await expect(this.page.getByLabel("Continuation key", { exact: true })).toBeHidden();
     await this.page.getByRole("radio", { name: "Same conversation", exact: true }).click();
+    await expect(
+      this.page.getByRole("button", { name: /Advanced.*Agent continuity: Same conversation/u }),
+    ).toBeVisible();
   }
 
   async save(name: string) {
@@ -463,9 +983,10 @@ export class OrganizationTriggers {
 
   async expectComboboxes() {
     for (const name of [
-      "When this happens",
+      "Event",
       "Connection",
-      "Run on daemon",
+      "Daemon",
+      "Working directory",
       "Agent",
       "Execution mode",
       "Thinking",
@@ -495,8 +1016,21 @@ export class OrganizationTriggers {
     expect(sizing.clientHeight).toBeGreaterThanOrEqual(sizing.scrollHeight - 2);
   }
 
+  async nameTrigger(name: string) {
+    await this.page.getByLabel("Trigger name").fill(name);
+  }
+
+  async expectYamlMatches(expected: Record<string, unknown>) {
+    expect(parseDocument(await this.readYaml()).toJS()).toMatchObject(expected);
+  }
+
+  async expectYamlOmits(fragment: string) {
+    expect(await this.readYaml()).not.toContain(fragment);
+  }
+
   async expectYamlContains(...fragments: string[]) {
-    for (const fragment of fragments) await expect(this.yamlEditor()).toContainText(fragment);
+    const yaml = await this.readYaml();
+    for (const fragment of fragments) expect(yaml).toContain(fragment);
   }
 
   async expectLegacyReadOnly() {
@@ -519,10 +1053,32 @@ export class OrganizationTriggers {
    * there is no mark: the title used to sit 12px right of every other line in the card, on
    * phones only, because from `sm` the header is a flex row where an absent mark takes no space.
    */
+  /**
+   * Every option and checkbox in the open Advanced section stays inside it on a phone. The
+   * continuity options are wider than a phone together; they used to widen the section's grid
+   * and cut off the right edge of everything under them.
+   */
+  async expectAdvancedFitsAtPhoneWidth() {
+    const viewport = this.page.viewportSize();
+    await this.page.setViewportSize({ width: 390, height: 844 });
+    const header = this.page.getByRole("button", { name: /Advanced.*Agent continuity/u });
+    await expect(header).toHaveAttribute("aria-expanded", "true");
+    const section = this.page.getByRole("region", { name: /Advanced.*Agent continuity/u });
+    const bounds = await section.boundingBox();
+    if (bounds === null) throw new Error("The Advanced section is not on screen");
+    const controls = section.locator('[role="radio"], label');
+    for (const control of await controls.all()) {
+      const box = await control.boundingBox();
+      if (box === null) throw new Error("An Advanced control is not on screen");
+      expect(box.x + box.width).toBeLessThanOrEqual(bounds.x + bounds.width);
+    }
+    if (viewport !== null) await this.page.setViewportSize(viewport);
+  }
+
   async expectDisclosureRailsAtPhoneWidth() {
     const viewport = this.page.viewportSize();
     await this.page.setViewportSize({ width: 420, height: 900 });
-    for (const name of ["Advanced provider options", "GitHub access"]) {
+    for (const name of ["Advanced provider options", "Agent continuity"]) {
       const header = this.page.getByRole("button", { name, exact: false }).first();
       await header.scrollIntoViewIfNeeded();
       const rails = await header.evaluate((element: HTMLElement) =>
@@ -553,7 +1109,7 @@ export class OrganizationTriggers {
     await this.page.screenshot({ path });
   }
 
-  private async selectAgent(agentId: string) {
+  async selectAgent(agentId: string) {
     await this.page.getByRole("combobox", { name: "Agent" }).click();
     await this.page.locator(`[role="option"][data-value=${JSON.stringify(agentId)}]`).click();
   }
@@ -563,7 +1119,21 @@ export class OrganizationTriggers {
     await this.page.locator(`[role="option"][data-value=${JSON.stringify(value)}]`).click();
   }
 
+  private async readYaml() {
+    await allowClipboard(this.page, new URL(this.page.url()).origin);
+    await this.page.getByRole("button", { name: "Copy Trigger YAML", exact: true }).click();
+    return this.page.evaluate(() => navigator.clipboard.readText());
+  }
+
   private yamlEditor() {
     return this.page.getByRole("textbox", { name: "Trigger YAML" });
   }
+}
+
+function isRotation(request: Request): boolean {
+  return request.method() === "POST" && (request.postData() ?? "").includes("rotate");
+}
+
+function isRefresh(request: Request): boolean {
+  return request.method() === "GET" && request.url().includes("_serverFn");
 }

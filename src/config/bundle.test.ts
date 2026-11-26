@@ -83,6 +83,13 @@ function hasBundleIssue(error: unknown, path: string, message: RegExp): boolean 
 }
 
 describe("Hub configuration bundle", () => {
+  it("directs webhook events to self-contained trigger deployment", () => {
+    assert.throws(
+      () => compileHubBundle(filesWithWorkflow(workflow.replace("manual.run", "webhook.received"))),
+      (error) => hasBundleIssue(error, ".paseo/workflows/route.yml.on", /\.paseo\/triggers/u),
+    );
+  });
+
   it("accepts an optional project name as slug-validated deployment metadata", () => {
     const bundle = compileHubBundle(filesWithHub(`name: agent-tools\n${hub}`));
 
@@ -132,6 +139,44 @@ describe("Hub configuration bundle", () => {
       content: "Keep context exact.",
       contentHash: "4d64ca5298d18aaf016856e6579d80ec097e276c0acf1fa061689b0643844b8d",
     });
+  });
+
+  /**
+   * A daemon validates an agent against the catalog of each directory it may run in, so a
+   * directory or named agent the workflow can never select must not be checked: it could
+   * reject a bundle whose every reachable launch is valid.
+   */
+  it("validates each named agent only in the environments its step can select", () => {
+    const unreachable = hub
+      .replace(
+        "agents:",
+        [
+          "  docs:",
+          "    kind: daemon",
+          "    daemon: local",
+          "    cwd: /workspace/docs",
+          "agents:",
+        ].join("\n"),
+      )
+      .concat(["  reviewer:", "    provider: opencode", ""].join("\n"));
+    const files = [
+      ...canonicalFiles().filter(({ path }) => path !== ".paseo/hub.yml"),
+      { path: ".paseo/hub.yml", content: unreachable },
+    ];
+    const bundle = compileHubBundle(files);
+
+    assert.deepEqual(
+      bundle.agentValidationTargets
+        .map(({ name, environmentNames }) => ({
+          name,
+          environmentNames: [...environmentNames].sort(),
+        }))
+        .sort((left, right) => left.name.localeCompare(right.name)),
+      [
+        { name: "claude", environmentNames: ["hub", "paseo"] },
+        { name: "codex-safe", environmentNames: ["hub", "paseo"] },
+      ],
+    );
   });
 
   it("rejects monolithic triggers with a direct migration error", () => {

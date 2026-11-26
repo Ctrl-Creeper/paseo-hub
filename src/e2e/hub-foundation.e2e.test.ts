@@ -23,7 +23,7 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
     assert.deepEqual(shutdown?.leakedProcesses ?? [], []);
   }, 120_000);
 
-  it("continues a conversation through session tools and restores its archived workspace", async () => {
+  it("continues a hidden conversation through session tools and restores its archived workspace", async () => {
     await hub.connect();
     await hub.daemonIsConnected();
     await hub.enableAgentContinuation();
@@ -31,6 +31,7 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
     const firstResult = await hub.completedCapabilityRun(first.executionId);
     assert.equal(firstResult.replySucceeded, true);
     assert.equal(firstResult.duplicateRejected, true);
+    await hub.sessionIdleWasAcknowledged(first.executionId);
     await hub.sessionIsArchived(first.executionId);
     const session = await hub.sessionEvidence(first.executionId);
     const second = await hub.runCapabilityTrigger("continuation-second", "one-thread");
@@ -121,7 +122,7 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
     ]);
     assert.equal(configuration.slackWorkerEnvironment, "${{ values.selected_environment }}");
     assert.equal(configuration.slackAgentSelector, "${{ values.selected_agent }}");
-    assert.deepEqual(configuration.codexOptions, {
+    assert.deepEqual(configuration.agentChoiceOptions["codex"], {
       sandbox_workspace_write: {
         writable_roots: ["/var/cache/npm"],
         network_access: false,
@@ -141,6 +142,7 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
     await hub.daemonIsConnected();
     const connected = await hub.status();
     const unrelatedAgent = await hub.createUnrelatedLocalAgent();
+    const projects = await hub.requestProjectList();
     await hub.installProductionConfiguration();
 
     const run = await hub.runManual("canonical-delivery", "payments");
@@ -150,6 +152,16 @@ describeHubE2E("Paseo Hub cross-repository contract", () => {
     const denial = await hub.requestForbiddenOperation();
 
     assert.equal(connected.state, "connected");
+    assert.ok(
+      Array.isArray(projects["projects"]) &&
+        projects["projects"].some(
+          (project: unknown) =>
+            typeof project === "object" &&
+            project !== null &&
+            "projectRootPath" in project &&
+            project.projectRootPath === hub.workspacePath(),
+        ),
+    );
     assert.deepEqual(completed, {
       prompt: "Deploy requested for phase-five-operator",
       output: "phase-five:requested",

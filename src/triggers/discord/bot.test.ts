@@ -1,10 +1,58 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { DiscordAPIError, RESTJSONErrorCodes, type Client } from "discord.js";
+import { DiscordAPIError, MessageFlags, RESTJSONErrorCodes, Client } from "discord.js";
+import { setTimeout as delay } from "node:timers/promises";
 import { describe, it } from "vitest";
 import { createDiscordBotClient } from "./bot.js";
 
 describe("Discord bot client", () => {
+  it("abandons a silent login, bounds destruction, and cleans up a late login", async () => {
+    const client = new ControlledLoginClient({ hangOnDestroy: true });
+    const bot = createDiscordBotClient({
+      token: "token",
+      client,
+      startupTimeoutMs: 10,
+      cleanupTimeoutMs: 10,
+    });
+    const stopping = bot.start();
+
+    await assert.rejects(
+      Promise.race([
+        stopping,
+        delay(500, undefined, { ref: false }).then(() => {
+          throw new Error("startup remained pending");
+        }),
+      ]),
+      { name: "DiscordStartupTimeoutError", code: "timeout" },
+    );
+    assert.equal(client.destructions, 1);
+    await bot.stop();
+
+    client.finishLogin("token");
+    await delay(0);
+    assert.equal(client.destructions, 2);
+    await assert.rejects(bot.start(), { name: "DiscordStartupTimeoutError" });
+    assert.equal(client.logins, 1);
+  });
+
+  it("shares a responsive login and stops the client normally", async () => {
+    const client = new ControlledLoginClient();
+    const bot = createDiscordBotClient({ token: "token", client, startupTimeoutMs: 100 });
+    const first = bot.start();
+    const second = bot.start();
+    client.finishLogin("token");
+    await Promise.all([first, second]);
+    assert.equal(client.logins, 1);
+    assert.equal(client.destructions, 0);
+    await bot.stop();
+    assert.equal(client.destructions, 1);
+  });
+
+  it("preserves the SDK invalid-token error", async () => {
+    const bot = createDiscordBotClient({ token: "", client: new Client({ intents: [] }) });
+    await assert.rejects(bot.start(), { code: "TokenInvalid" });
+  });
+
   it("classifies a disallowed-intents gateway close from its structured code", async () => {
     const canary = "gateway-login-secret-3f72";
     const client = new FakeGatewayClient(4014, new Error(canary));
@@ -119,9 +167,17 @@ describe("Discord bot client", () => {
     const createdThread = channel.message?.thread;
     assert.ok(createdThread);
     assert.deepEqual(createdThread.sentPayloads, [
-      { content: "done", allowedMentions: { parse: [] } },
-      { content: "more detail", allowedMentions: { parse: [] } },
-      { content: "final detail", allowedMentions: { parse: [] } },
+      { content: "done", allowedMentions: { parse: [] }, flags: MessageFlags.SuppressEmbeds },
+      {
+        content: "more detail",
+        allowedMentions: { parse: [] },
+        flags: MessageFlags.SuppressEmbeds,
+      },
+      {
+        content: "final detail",
+        allowedMentions: { parse: [] },
+        flags: MessageFlags.SuppressEmbeds,
+      },
     ]);
   });
 
@@ -144,7 +200,11 @@ describe("Discord bot client", () => {
 
     assert.deepEqual(message.startedThreads, []);
     assert.deepEqual(existingThread.sentPayloads, [
-      { content: "existing thread reply", allowedMentions: { parse: [] } },
+      {
+        content: "existing thread reply",
+        allowedMentions: { parse: [] },
+        flags: MessageFlags.SuppressEmbeds,
+      },
     ]);
   });
 
@@ -172,8 +232,16 @@ describe("Discord bot client", () => {
 
     assert.deepEqual(channel.sentPayloads, []);
     assert.deepEqual(thread.sentPayloads, [
-      { content: "thread reply", allowedMentions: { parse: [] } },
-      { content: "second thread reply", allowedMentions: { parse: [] } },
+      {
+        content: "thread reply",
+        allowedMentions: { parse: [] },
+        flags: MessageFlags.SuppressEmbeds,
+      },
+      {
+        content: "second thread reply",
+        allowedMentions: { parse: [] },
+        flags: MessageFlags.SuppressEmbeds,
+      },
     ]);
   });
 
@@ -201,6 +269,36 @@ describe("Discord bot client", () => {
     );
     assert.deepEqual(thread.historyRequests, [{ before: "300", limit: 50 }]);
     assert.equal(thread.starterReads, 1);
+  });
+
+  it("keeps embeds on referenced messages and thread starters", async () => {
+    const referenced = contextMessage("300", "200", "", 0, [releaseFailureEmbed()]);
+    const starter = contextMessage("200", "100", "", 0, [releaseFailureEmbed()]);
+    const bot = createDiscordBotClient({
+      token: "token",
+      clientId: "900",
+      client: createFakeClient(
+        new FakeSendableChannel({ message: referenced }),
+        new FakeReadableThread(starter, []),
+      ),
+    });
+
+    const message = await bot.readMessage({ channelId: "200", messageId: "300" });
+    const [threadStarter] = await bot.readThreadMessages({
+      channelId: "207",
+      beforeMessageId: "300",
+    });
+
+    const normalizedEmbed = {
+      title: "Deploy failed",
+      description: "The production deploy exited with code 1",
+      url: "https://ci.example.test/runs/42",
+      author: "CI",
+      fields: [{ name: "Branch", value: "main" }],
+      footer: "Run 42",
+    };
+    assert.deepEqual(message.embeds, [normalizedEmbed]);
+    assert.deepEqual(threadStarter?.embeds, [normalizedEmbed]);
   });
 
   it("rejects thread context when Discord cannot provide its starter", async () => {
@@ -275,11 +373,11 @@ describe("Discord bot client", () => {
   });
 });
 
-class FakeSendableChannel {
+class FakeSendableChannel<TMessage extends FakeMessage | FakeContextMessage = FakeMessage> {
   readonly sentPayloads: unknown[] = [];
-  readonly messages: { fetch: (messageId: string) => Promise<FakeMessage> };
+  readonly messages: { fetch: (messageId: string) => Promise<TMessage> };
 
-  constructor(readonly options: { message?: FakeMessage; messageFetchError?: Error } = {}) {
+  constructor(readonly options: { message?: TMessage; messageFetchError?: Error } = {}) {
     this.messages = {
       fetch: async (messageId: string) => {
         assert.equal(messageId, "300");
@@ -294,7 +392,7 @@ class FakeSendableChannel {
     };
   }
 
-  get message(): FakeMessage | undefined {
+  get message(): TMessage | undefined {
     return this.options.message;
   }
 
@@ -335,7 +433,22 @@ interface FakeContextMessage {
   author: { id: string; username: string; bot: boolean };
   createdAt: Date;
   attachments: Map<string, never>;
+  embeds: FakeEmbed[];
   reference: null;
+}
+
+// The discord.js `Embed` getters a received message exposes; its constructor is private.
+interface FakeEmbed {
+  title: string | null;
+  description: string | null;
+  url: string | null;
+  color: number | null;
+  timestamp: string | null;
+  author: { name: string; url?: string; iconURL?: string } | null;
+  fields: Array<{ name: string; value: string; inline?: boolean }>;
+  footer: { text: string; iconURL?: string } | null;
+  image: { url: string } | null;
+  thumbnail: { url: string } | null;
 }
 
 function contextMessage(
@@ -343,6 +456,7 @@ function contextMessage(
   channelId: string,
   content: string,
   seconds: number,
+  embeds: FakeEmbed[] = [],
 ): FakeContextMessage {
   return {
     id,
@@ -351,8 +465,50 @@ function contextMessage(
     author: { id: "400", username: "maintainer", bot: false },
     createdAt: new Date(1_700_000_000_000 + seconds * 1_000),
     attachments: new Map<string, never>(),
+    embeds,
     reference: null,
   };
+}
+
+function releaseFailureEmbed(): FakeEmbed {
+  return {
+    title: "Deploy failed",
+    description: "The production deploy exited with code 1",
+    url: "https://ci.example.test/runs/42",
+    color: 0xe8837a,
+    timestamp: "2026-11-23T10:00:00.000Z",
+    author: { name: "CI", iconURL: "https://ci.example.test/icon.png" },
+    fields: [{ name: "Branch", value: "main", inline: true }],
+    footer: { text: "Run 42" },
+    image: null,
+    thumbnail: { url: "https://ci.example.test/thumb.png" },
+  };
+}
+
+class ControlledLoginClient extends Client {
+  finishLogin!: (token: string) => void;
+  private readonly pendingLogin = new Promise<string>((resolve) => {
+    this.finishLogin = resolve;
+  });
+  logins = 0;
+  destructions = 0;
+
+  constructor(private readonly behavior: { hangOnDestroy?: boolean } = {}) {
+    super({ intents: [] });
+  }
+
+  override login(): Promise<string> {
+    this.logins += 1;
+    return this.pendingLogin;
+  }
+
+  override async destroy(): Promise<void> {
+    this.destructions += 1;
+    if (this.behavior.hangOnDestroy && this.destructions === 1) {
+      await new Promise<void>(() => {});
+    }
+    await super.destroy();
+  }
 }
 
 class FakeGatewayClient extends EventEmitter {
@@ -391,7 +547,7 @@ class FakeMessage {
 }
 
 function createFakeClient(
-  channel: FakeSendableChannel,
+  channel: FakeSendableChannel<FakeMessage | FakeContextMessage>,
   thread?: FakeSendableChannel | FakeReadableThread,
   options: { deleteReactionError?: Error } = {},
 ): Client {
@@ -400,11 +556,14 @@ function createFakeClient(
       return fakeClient;
     },
     channels: {
-      async fetch(channelId: string): Promise<FakeSendableChannel | FakeReadableThread> {
+      async fetch(
+        channelId: string,
+      ): Promise<FakeSendableChannel<FakeMessage | FakeContextMessage> | FakeReadableThread> {
         if (channelId === "207" && thread !== undefined) {
           return thread;
         }
-        const attachedThread = channel.message?.thread;
+        const attachedThread =
+          channel.message instanceof FakeMessage ? channel.message.thread : undefined;
         if (channelId === "300" && attachedThread !== undefined && attachedThread !== null)
           return attachedThread;
         assert.equal(channelId, "200");

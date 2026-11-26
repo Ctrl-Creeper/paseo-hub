@@ -26,7 +26,7 @@ interface PendingRequest<T> {
 
 /** Shape of the internal fields `ws` leaves untyped but always populates. */
 interface WebSocketInternals {
-  _socket: { write(data: Buffer): void };
+  _socket: { write(data: Buffer): void; pause(): void };
 }
 
 export class DaemonRegistryHarness {
@@ -40,12 +40,20 @@ export class DaemonRegistryHarness {
   private didShutdown = false;
   private stopped = false;
 
-  constructor(logger?: Pick<Logger, "warn" | "error">) {
-    this.registry = new ActiveDaemonRegistry(this.presence, undefined, logger);
+  constructor(logger?: Pick<Logger, "warn" | "error">, projectListTimeoutMs?: number) {
+    this.registry = new ActiveDaemonRegistry(
+      this.presence,
+      undefined,
+      logger,
+      projectListTimeoutMs,
+    );
   }
 
-  static async start(logger?: Pick<Logger, "warn" | "error">): Promise<DaemonRegistryHarness> {
-    const harness = new DaemonRegistryHarness(logger);
+  static async start(
+    logger?: Pick<Logger, "warn" | "error">,
+    projectListTimeoutMs?: number,
+  ): Promise<DaemonRegistryHarness> {
+    const harness = new DaemonRegistryHarness(logger, projectListTimeoutMs);
     await harness.serverListening();
     await harness.replaceConnection();
     return harness;
@@ -59,9 +67,6 @@ export class DaemonRegistryHarness {
       cwd: "/workspace",
       env: {},
       providerOptions: { permission: { edit: "ask", bash: "deny" } },
-      toolPolicy: {
-        preapproved: [{ kind: "mcp", server: "hub", tool: "finish_execution" }],
-      },
     });
     void promise.catch(() => undefined);
     return {
@@ -88,13 +93,16 @@ export class DaemonRegistryHarness {
     };
   }
 
-  async pendingAgentValidation() {
-    const promise = this.registry.validateAgentConfiguration(this.daemon.id, {
-      provider: "definitely-not-installed",
-      model: "imaginary-model",
-      mode: "imaginary-mode",
-      options: { nonsense: true },
-    });
+  async pendingAgentValidation(cwd = "/workspace") {
+    const promise = this.connection().validateAgentConfiguration(
+      {
+        provider: "definitely-not-installed",
+        model: "imaginary-model",
+        mode: "imaginary-mode",
+        options: { nonsense: true },
+      },
+      { cwd },
+    );
     void promise.catch(() => undefined);
     return {
       promise,
@@ -118,6 +126,39 @@ export class DaemonRegistryHarness {
       promise,
       request: await this.currentSocket().next("refresh_providers_snapshot_request"),
     };
+  }
+
+  listProjects() {
+    return this.connection().listProjects();
+  }
+
+  async pendingProjectList() {
+    const promise = this.listProjects();
+    void promise.catch(() => undefined);
+    return { promise, request: await this.currentSocket().next("project.list.request") };
+  }
+
+  respondProjectList(
+    pending: Awaited<ReturnType<DaemonRegistryHarness["pendingProjectList"]>>,
+    projects: readonly Record<string, unknown>[],
+  ): void {
+    this.currentSocket().send({
+      type: "project.list.response",
+      payload: { requestId: pending.request.requestId, projects },
+    });
+  }
+
+  /** The daemon's own refusal of a request, as it reports one it will not or cannot serve. */
+  rejectRequest(pending: { request: { requestId: string; type: string } }, code: string): void {
+    this.currentSocket().send({
+      type: "rpc_error",
+      payload: {
+        requestId: pending.request.requestId,
+        requestType: pending.request.type,
+        error: "daemon refused",
+        code,
+      },
+    });
   }
 
   respondProviderSnapshot(
@@ -271,6 +312,10 @@ export class DaemonRegistryHarness {
 
   sendInvalidClose(code: number): void {
     this.currentSocket().sendInvalidClose(code);
+  }
+
+  ignoreCloseHandshake(): void {
+    this.currentSocket().stopReading();
   }
 
   waitUntilCurrentClosed(): Promise<void> {
@@ -470,6 +515,13 @@ class RegistrySocket {
     const maskedPayload = Buffer.alloc(2);
     for (let i = 0; i < 2; i += 1) maskedPayload[i] = payload[i]! ^ mask[i]!;
     tcpSocket.write(Buffer.concat([Buffer.from([0x88, 0x82]), mask, maskedPayload]));
+  }
+
+  /** Stops reading from the wire, so the daemon never answers the server's close frame. */
+  stopReading(): void {
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion -- `ws` leaves `_socket` untyped
+    const internals = this.socket as unknown as WebSocketInternals;
+    internals._socket.pause();
   }
 
   close(): void {

@@ -1,6 +1,5 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop -- workspace controls bind their own configuration */
 import { useState } from "react";
-import { CheckboxField } from "../components/app/checkbox-field.js";
 import { Disclosure } from "../components/app/disclosure.js";
 import { FormField } from "../components/app/form-field.js";
 import { SegmentedControl, type SegmentedOption } from "../components/app/segmented-control.js";
@@ -26,11 +25,7 @@ export function WorkspaceFields({
 }) {
   // Open when the trigger already departs from the defaults, so nothing it does is hidden.
   const [workspaceExpanded, setWorkspaceExpanded] = useState(
-    form.worktreeMode !== "" ||
-      form.title !== "" ||
-      form.startupTimeout !== "" ||
-      !form.autoArchive ||
-      form.background,
+    form.worktreeMode !== "" || form.title !== "" || form.startupTimeout !== "",
   );
   const update = <Key extends keyof TriggerFormValue>(key: Key, value: TriggerFormValue[Key]) =>
     onChange({ ...form, [key]: value });
@@ -45,7 +40,7 @@ export function WorkspaceFields({
       open={workspaceExpanded}
       onOpenChange={setWorkspaceExpanded}
       title="Workspace"
-      description="Where in the checkout the agent works, and what happens to it afterwards."
+      description="Where in the checkout the agent works."
     >
       <SegmentedControl
         label="Worktree"
@@ -112,20 +107,6 @@ export function WorkspaceFields({
           onChange={text("startupTimeout")}
         />
       </div>
-      <CheckboxField
-        id="trigger-auto-archive"
-        label="Archive the workspace when the run ends"
-        description="Unticked, the workspace stays open on the daemon after the run."
-        checked={form.autoArchive}
-        onChange={(checked) => update("autoArchive", checked)}
-      />
-      <CheckboxField
-        id="trigger-background"
-        label="Background workspace"
-        description="Hidden from workspace listings unless a client asks for background workspaces. Daemons without support ignore it."
-        checked={form.background}
-        onChange={(checked) => update("background", checked)}
-      />
     </Disclosure>
   );
 }

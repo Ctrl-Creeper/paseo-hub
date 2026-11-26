@@ -13,8 +13,8 @@ describe("organization trigger store", () => {
   it("creates and updates one hidden runtime without exposing a project", async () => {
     const database = await enrolledDatabase();
     const store = new OrganizationTriggerStore(database, "org", acceptingAgentValidator());
-    const first = await store.save({ yaml: triggerYaml(true), userId: null });
-    const second = await store.save({
+    const { trigger: first } = await store.save({ yaml: triggerYaml(true), userId: null });
+    const { trigger: second } = await store.save({
       triggerId: first.id,
       yaml: triggerYaml(false),
       userId: null,
@@ -36,18 +36,11 @@ describe("organization trigger store", () => {
     assert.equal((await database.listProjectsForOrganization("org")).length, 0);
   });
 
-  it.each([
-    ["a relative working directory", "cwd: workspace", /absolute path/iu],
-    ["an omitted execution mode", "provider: codex, mode: full-access", /mode.*required/iu],
-  ])("rejects %s at the authoring boundary", async (_name, authored, expected) => {
+  it("rejects a relative working directory at the authoring boundary", async () => {
     const database = createMemoryDatabase({ organizationIds: ["org"] });
     const store = new OrganizationTriggerStore(database, "org", acceptingAgentValidator());
-    const yaml = triggerYaml(true).replace(
-      authored === "cwd: workspace" ? "cwd: /workspace" : authored,
-      authored === "cwd: workspace" ? authored : "provider: codex",
-    );
-
-    await assert.rejects(store.save({ yaml, userId: null }), expected);
+    const yaml = triggerYaml(true).replace("cwd: /workspace", "cwd: workspace");
+    await assert.rejects(store.save({ yaml, userId: null }), /absolute path/iu);
   });
 
   /**
@@ -97,26 +90,49 @@ describe("organization trigger store", () => {
   });
 
   /**
-   * `Provider 'omp' cannot preapprove exact MCP tools for unattended execution` is what the
-   * daemon says when Hub sends its tool policy to a provider that cannot honour one. Hub sends
-   * that policy with every run, so the provider is refused at save.
+   * #209: the model picker lists the OpenCode models of the target working directory, so saving
+   * must ask the daemon about that directory, not its global catalog.
    */
-  it("rejects a provider that cannot run unattended, without asking the daemon", async () => {
+  it("accepts a model the daemon offers only in the target working directory", async () => {
     const database = await enrolledDatabase();
     const store = new OrganizationTriggerStore(
       database,
       "org",
-      catalogAgentValidator({ omp: { modes: ["full-access"] } }),
+      catalogAgentValidator(
+        { opencode: { models: [], modes: ["build"] } },
+        { "/workspace": { opencode: { models: ["openai/gpt-6.1-sol"], modes: ["build"] } } },
+      ),
     );
 
-    await assert.rejects(
-      store.save({
-        yaml: triggerYaml(true).replace("provider: codex", "provider: omp"),
-        userId: null,
-      }),
-      /run\.agent\.provider: Provider 'omp' cannot run unattended Hub automations; select Claude, Codex, or OpenCode/u,
-    );
+    await store.save({
+      yaml: triggerYaml(true).replace(
+        "agent: { provider: codex, mode: full-access }",
+        "agent: { provider: opencode, model: openai/gpt-6.1-sol, mode: build }",
+      ),
+      userId: null,
+    });
+    assert.equal((await store.list()).length, 1);
   });
+
+  it.each(["pi", "custom-provider"])(
+    "accepts daemon provider %s without a mode",
+    async (provider) => {
+      const database = await enrolledDatabase();
+      const store = new OrganizationTriggerStore(
+        database,
+        "org",
+        catalogAgentValidator({ [provider]: { modes: [] } }),
+      );
+      await store.save({
+        yaml: triggerYaml(true).replace(
+          "provider: codex, mode: full-access",
+          `provider: ${provider}`,
+        ),
+        userId: null,
+      });
+      assert.equal((await store.list()).length, 1);
+    },
+  );
 
   it("refuses a new trigger while the target daemon cannot be asked", async () => {
     const database = await enrolledDatabase();
@@ -131,10 +147,10 @@ describe("organization trigger store", () => {
   it("still saves a prompt edit while the daemon is offline when the agent is unchanged", async () => {
     const database = await enrolledDatabase();
     const connected = new OrganizationTriggerStore(database, "org", acceptingAgentValidator());
-    const trigger = await connected.save({ yaml: triggerYaml(true), userId: null });
+    const { trigger } = await connected.save({ yaml: triggerYaml(true), userId: null });
     const offline = new OrganizationTriggerStore(database, "org", disconnectedAgentValidator());
 
-    const edited = await offline.save({
+    const { trigger: edited } = await offline.save({
       triggerId: trigger.id,
       yaml: triggerYaml(true).replace("prompt: Handle it", "prompt: Handle it carefully"),
       userId: null,

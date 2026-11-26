@@ -14,6 +14,7 @@ export function Card({
   title,
   description,
   action,
+  footer,
   children,
   className,
 }: {
@@ -25,6 +26,11 @@ export function Card({
   action?: ReactNode;
   /** Optional: a card that is only a title and an action is still a card. */
   children?: ReactNode;
+  /**
+   * A quiet line closing the card: one fact about its records, and links to where they are
+   * listed in full.
+   */
+  footer?: SurfaceFooter;
   /** Placement in a parent grid only. Never used to change how the card looks. */
   className?: string;
 }) {
@@ -40,7 +46,9 @@ export function Card({
               </span>
             )}
             <div className="grid min-w-0 gap-1">
-              {title === undefined ? null : <h2 className="text-sm text-foreground">{title}</h2>}
+              {title === undefined ? null : (
+                <h2 className="text-base font-title text-foreground">{title}</h2>
+              )}
               {description === undefined ? null : (
                 <p className="text-sm text-muted-foreground">{description}</p>
               )}
@@ -50,7 +58,29 @@ export function Card({
         </div>
       ) : null}
       {children}
+      {footer === undefined ? null : <CardFooter {...footer} />}
     </section>
+  );
+}
+
+/** A quiet line closing a bordered surface, and at most a control or two at its far end. */
+export interface SurfaceFooter {
+  note: string;
+  actions?: ReactNode;
+}
+
+/**
+ * The closing line of a `Card` or a `Disclosure`, one anatomy for both: a rule, a muted note,
+ * and its actions at the far edge. The surface spaces it from the body above.
+ */
+export function CardFooter({ note, actions }: SurfaceFooter) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t pt-4">
+      <p className="text-xs text-muted-foreground tabular-nums">{note}</p>
+      {actions === undefined ? null : (
+        <div className="flex shrink-0 items-center gap-2">{actions}</div>
+      )}
+    </div>
   );
 }
 
